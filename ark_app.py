@@ -1,32 +1,32 @@
 
 import streamlit as st
 import pandas as pd
-import json, os, sqlite3, tempfile, hashlib, binascii
+import json, os, sqlite3, tempfile, hashlib, base64
 from datetime import datetime, date
 import ark_scheduler as ark
 from ark_dictionary import DICT_CSV
 
 st.set_page_config(page_title="ARK Production Scheduler", layout="wide")
 
-# -------------------- Auth utilities --------------------
-def hash_password(password: str, iterations: int = 200_000) -> str:
-    import os, hashlib, binascii
-    salt = os.urandom(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-    return f"pbkdf2_sha256${iterations}${binascii.hexlify(salt).decode()}${binascii.hexlify(dk).decode()}"
+# -------------------- Security helpers --------------------
+def pbkdf2_hash(password: str, salt_b: bytes=None, rounds: int=200_000) -> (str, str):
+    """
+    Returns (salt_b64, hash_b64). If salt_b is None, generates random salt.
+    """
+    if salt_b is None:
+        salt_b = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt_b, rounds)
+    return base64.b64encode(salt_b).decode("utf-8"), base64.b64encode(dk).decode("utf-8")
 
-def verify_password(password: str, stored: str) -> bool:
+def verify_password(password: str, salt_b64: str, hash_b64: str, rounds: int=200_000) -> bool:
     try:
-        algo, iter_str, salt_hex, hash_hex = stored.split("$", 3)
-        iterations = int(iter_str)
-        salt = binascii.unhexlify(salt_hex)
-        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-        return binascii.hexlify(dk).decode() == hash_hex
+        salt_b = base64.b64decode(salt_b64.encode("utf-8"))
+        _, h2 = pbkdf2_hash(password, salt_b=salt_b, rounds=rounds)
+        return h2 == hash_b64
     except Exception:
         return False
 
-# -------------------- Dictionary helpers --------------------
-import tempfile
+# -------------------- Dictionary helpers (service stages & piece types) --------------------
 def get_dict_struct():
     with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", encoding="utf-8") as tdf:
         tdf.write(DICT_CSV)
@@ -35,7 +35,8 @@ def get_dict_struct():
     piece_types = set()
     for sb in service_blocks.values():
         piece_types.update([x for x in sb["Piece Type"].tolist() if isinstance(x, str)])
-    return service_blocks, service_stage_orders, sorted(piece_types)
+    piece_types = sorted(piece_types)
+    return service_blocks, service_stage_orders, piece_types
 
 SERVICE_BLOCKS, SERVICE_STAGE_ORDERS, PIECE_TYPES = get_dict_struct()
 SERVICES = ["Restore", "3-Coat", "Resurface"]
@@ -47,6 +48,7 @@ def get_conn():
     conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
+
 
 def init_db():
     conn = get_conn()
@@ -144,106 +146,141 @@ def init_db():
         active INTEGER NOT NULL DEFAULT 1
     );
     """)
-    # Pre-seed requested admin if not present
-    cur.execute("SELECT id FROM users WHERE email=?", ('info@arkfurniture.ca',))
-    row = cur.fetchone()
-    if row is None:
-        # name from workspace metadata; role admin; password 'password'
-        pwh = hash_password("password")
-        cur.execute("""INSERT INTO users(name,email,role,password_hash,employee_id,active)
-                       VALUES (?,?,?,?,?,1)""",
-                    ("Kyle Babineau","info@arkfurniture.ca","admin",pwh,None))
+    # Pre-seed admin if none exists
+    cur.execute("SELECT COUNT(*) FROM users;")
+    if cur.fetchone()[0] == 0:
+        try:
+            pwh = hash_password("password")
+            cur.execute("""INSERT INTO users(name,email,role,password_hash,employee_id,active)
+                           VALUES (?,?,?,?,?,1)""",
+                        ("ARK Admin","info@arkfurniture.ca","admin",pwh,None))
+        except Exception as e:
+            pass
     conn.commit()
     conn.close()
+
 
 init_db()
+# -------------------- Auth UI --------------------
+def users_exist() -> bool:
+    return fetch_df("SELECT COUNT(*) as n FROM users")["n"].iloc[0] > 0
 
-def fetch_df(query, params=()):
-    conn = get_conn()
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
-    return df
-
-def execute(query, params=()):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(query, params)
-    conn.commit()
-    conn.close()
-
-# -------------------- Session auth helpers --------------------
-if "auth_user" not in st.session_state:
-    st.session_state["auth_user"] = None  # dict with keys id,name,email,role,employee_id
-
-def login_view():
-    st.title("ARK Production Scheduler")
-    st.subheader("Sign in")
-    email = st.text_input("Email", "")
-    pw = st.text_input("Password", "", type="password")
-    if st.button("Sign in", type="primary"):
-        try:
+def bootstrap_admin():
+    st.title("ARK Production Scheduler — Setup")
+    st.info("Create the first **Admin** account.")
+    with st.form("bootstrap_admin"):
+        u = st.text_input("Admin username")
+        p1 = st.text_input("Password", type="password")
+        p2 = st.text_input("Confirm password", type="password")
+        if st.form_submit_button("Create admin"):
+            if not u.strip() or not p1:
+                st.error("Username and password are required.")
+                st.stop()
+            if p1 != p2:
+                st.error("Passwords do not match."); st.stop()
+            salt, h = pbkdf2_hash(p1)
             conn = get_conn(); cur = conn.cursor()
-            cur.execute("SELECT id, name, email, role, password_hash, employee_id, active FROM users WHERE email=?", (email.strip(),))
-            row = cur.fetchone()
-            conn.close()
-            if not row:
-                st.error("Invalid email or password.")
-                return
-            uid, name, email2, role, pwh, emp_id, active = row
-            if not active:
-                st.error("Account is inactive. Contact admin.")
-                return
-            if not verify_password(pw, pwh):
-                st.error("Invalid email or password.")
-                return
-            st.session_state["auth_user"] = {"id": uid, "name": name, "email": email2, "role": role, "employee_id": emp_id}
-            st.success(f"Welcome, {name} ({role})")
-            st.experimental_rerun()
-        except Exception as e:
-            st.exception(e)
+            try:
+                cur.execute("INSERT INTO users(username, role, employee_id, salt_b64, hash_b64) VALUES (?,?,?,?,?)",
+                            (u.strip(), "admin", None, salt, h))
+                conn.commit()
+                st.success("Admin account created. Please log in.")
+                st.experimental_set_query_params(_=str(datetime.utcnow().timestamp()))
+            except Exception as e:
+                st.error(f"Error: {e}")
+            finally:
+                conn.close()
 
-def top_bar():
-    au = st.session_state["auth_user"]
-    if not au: return
-    st.sidebar.markdown(f"**Signed in as:** {au['name']}  \n**Role:** {au['role']}")
-    # Self-serve change password
-    with st.sidebar.expander("Change password"):
-        cur_pw = st.text_input("Current password", type="password", key="cp_cur")
-        new_pw = st.text_input("New password", type="password", key="cp_new")
-        new_pw2 = st.text_input("Confirm new password", type="password", key="cp_new2")
-        if st.button("Update password", key="cp_btn"):
-            if not new_pw or new_pw != new_pw2:
-                st.warning("New passwords do not match.")
-            else:
+def login_form():
+    st.title("ARK Production Scheduler — Login")
+    with st.form("login"):
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
+        ok = st.form_submit_button("Log in")
+        if ok:
+            row = fetch_df("SELECT * FROM users WHERE username=?", (u.strip(),))
+            if row.empty:
+                st.error("Invalid username or password."); st.stop()
+            salt = row["salt_b64"].iloc[0]; h = row["hash_b64"].iloc[0]
+            if not verify_password(p, salt, h):
+                st.error("Invalid username or password."); st.stop()
+            st.session_state["auth"] = {
+                "username": row["username"].iloc[0],
+                "role": row["role"].iloc[0],
+                "employee_id": int(row["employee_id"].iloc[0]) if not pd.isna(row["employee_id"].iloc[0]) else None
+            }
+            st.experimental_set_query_params(_=str(datetime.utcnow().timestamp()))
+
+def logout_button():
+    with st.sidebar:
+        st.markdown("---")
+        if "auth" in st.session_state:
+            st.caption(f"Logged in as **{st.session_state['auth']['username']}** ({st.session_state['auth']['role']})")
+            if st.button("Log out"):
+                st.session_state.pop("auth", None)
+                st.experimental_set_query_params(_=str(datetime.utcnow().timestamp()))
+
+# -------------------- Admin Screens --------------------
+def admin_users_tab():
+    st.subheader("Users (Accounts)")
+    users = fetch_df("""SELECT u.id, u.username, u.role, e.name as employee, u.employee_id
+                        FROM users u LEFT JOIN employees e ON e.id=u.employee_id
+                        ORDER BY u.username""")
+    st.dataframe(users)
+
+    st.markdown("### Add User")
+    emp_df = fetch_df("SELECT * FROM employees ORDER BY name")
+    with st.form("add_user"):
+        c1,c2,c3 = st.columns(3)
+        u = c1.text_input("Username")
+        role = c2.selectbox("Role", ["admin","employee"])
+        link_emp = c3.selectbox("Link to employee (optional)", ["(none)"] + emp_df["name"].tolist()) if not emp_df.empty else c3.selectbox("Link to employee (optional)", ["(none)"])
+        p1 = st.text_input("Password", type="password")
+        p2 = st.text_input("Confirm password", type="password")
+        if st.form_submit_button("Create user"):
+            if not u.strip() or not p1:
+                st.error("Username and password required."); st.stop()
+            if p1 != p2:
+                st.error("Passwords do not match."); st.stop()
+            emp_id = None
+            if link_emp != "(none)" and not emp_df.empty:
+                emp_id = int(emp_df.loc[emp_df["name"]==link_emp, "id"].values[0])
+            salt, h = pbkdf2_hash(p1)
+            conn = get_conn(); cur = conn.cursor()
+            try:
+                cur.execute("INSERT INTO users(username, role, employee_id, salt_b64, hash_b64) VALUES (?,?,?,?,?)",
+                            (u.strip(), role, emp_id, salt, h))
+                conn.commit()
+                st.success(f"User '{u.strip()}' created.")
+            except Exception as e:
+                st.error(f"Could not create user: {e}")
+            finally:
+                conn.close()
+
+    if not users.empty:
+        st.markdown("### Delete User")
+        with st.form("del_user"):
+            sel = st.selectbox("Select user", users["username"].tolist())
+            if st.form_submit_button("Delete user"):
                 try:
-                    conn = get_conn(); cur = conn.cursor()
-                    cur.execute("SELECT password_hash FROM users WHERE id=?", (au["id"],))
-                    row = cur.fetchone()
-                    if not row or not verify_password(cur_pw or "", row[0]):
-                        st.error("Current password is incorrect.")
-                    else:
-                        pwh = hash_password(new_pw)
-                        cur.execute("UPDATE users SET password_hash=? WHERE id=?", (pwh, au["id"]))
-                        conn.commit(); conn.close()
-                        st.success("Password updated.")
+                    execute("DELETE FROM users WHERE username=?", (sel,))
+                    st.success(f"Deleted user '{sel}'")
                 except Exception as e:
-                    st.error(f"Could not change password: {e}")
-    if st.sidebar.button("Sign out"):
-        st.session_state["auth_user"] = None
-        st.experimental_rerun()
+                    st.error(f"Error deleting user: {e}")
 
-# -------------------- Admin views --------------------
 def admin_app():
-    top_bar()
     st.title("ARK Production Scheduler — Admin")
-
     tabs = st.tabs([
-        "Employees", "Jobs", "Special Projects", "Time Off",
-        "Priorities & Rules", "Run Scheduler", "User Management"
+        "Users", "Employees", "Jobs", "Special Projects", "Time Off",
+        "Priorities & Rules", "Run Scheduler"
     ])
 
-    # Employees
+    # ----- Users -----
     with tabs[0]:
+        admin_users_tab()
+
+    # ----- Employees -----
+    with tabs[1]:
         st.subheader("Employees")
         with st.form("add_employee"):
             c1, c2, c3 = st.columns(3)
@@ -301,7 +338,7 @@ def admin_app():
 
         if not emp_df.empty:
             with st.form("del_employee"):
-                st.markdown("**Delete an employee** (cascades to shifts/days-off/projects)")
+                st.markdown("**Delete an employee** (cascades to shifts/days-off/projects/users link)")
                 del_name = st.selectbox("Employee", emp_df["name"].tolist())
                 confirm = st.checkbox("Type DELETE below and check this", value=False, key="emp_del_chk")
                 text_confirm = st.text_input("Type: DELETE to confirm", "")
@@ -315,8 +352,8 @@ def admin_app():
                     else:
                         st.warning("Please confirm deletion by typing DELETE and checking the box.")
 
-    # Jobs
-    with tabs[1]:
+    # ----- Jobs -----
+    with tabs[2]:
         st.subheader("Jobs")
         svc = st.selectbox("Service", SERVICES, index=0, key="job_service")
         stage_options = ["Not Started"] + SERVICE_STAGE_ORDERS[svc]
@@ -350,8 +387,8 @@ def admin_app():
                     except Exception as e:
                         st.error(f"Could not delete job: {e}")
 
-    # Special Projects
-    with tabs[2]:
+    # ----- Special Projects -----
+    with tabs[3]:
         st.subheader("Special Projects (blocks time)")
         emp_df = fetch_df("SELECT * FROM employees ORDER BY name ASC")
         if emp_df.empty:
@@ -382,8 +419,8 @@ def admin_app():
                             ORDER BY sp.start_ts""")
         st.dataframe(sp_df)
 
-    # Time Off
-    with tabs[3]:
+    # ----- Time Off -----
+    with tabs[4]:
         st.subheader("Time Off (full days)")
         emp_df = fetch_df("SELECT * FROM employees ORDER BY name ASC")
         if emp_df.empty:
@@ -406,8 +443,8 @@ def admin_app():
                               ORDER BY d.off_date, e.name""")
         st.dataframe(off_df)
 
-    # Priorities & Rules
-    with tabs[4]:
+    # ----- Priorities & Rules -----
+    with tabs[5]:
         st.subheader("Priorities & Rules")
         cust_list = fetch_df("SELECT DISTINCT customer FROM jobs ORDER BY customer")["customer"].tolist()
         with st.form("add_cprio"):
@@ -459,253 +496,185 @@ def admin_app():
                             (ws, we, float(gap2), float(gap12), int(ae)))
                     st.success("Saved.")
 
-    # Run Scheduler
-    with tabs[5]:
-        st.subheader("Generate Schedule")
-        st.markdown("Uses the **embedded Production Hour Dictionary**; no upload needed.")
-        if st.button("Run Scheduler", type="primary"):
-            run_and_display_schedule()
-    # User Management
+    # ----- Run Scheduler -----
     with tabs[6]:
-        user_management_view()
+        run_scheduler_view(editable=True)
 
-# -------------------- Employee views (read-only) --------------------
-def employee_app():
-    top_bar()
-    au = st.session_state["auth_user"]
-    st.title("ARK — Employee Portal")
+# -------------------- Employee Screens (read-only) --------------------
+def build_runtime_cfg_and_schedule():
+    # Build config from DB
+    gs = fetch_df("SELECT * FROM global_settings WHERE id=1").iloc[0].to_dict()
+    emp = fetch_df("SELECT * FROM employees ORDER BY name").to_dict(orient="records")
+    shifts = fetch_df("SELECT * FROM employee_shifts").to_dict(orient="records")
+    offs = fetch_df("SELECT * FROM employee_days_off").to_dict(orient="records")
+    sps = fetch_df("SELECT * FROM special_projects").to_dict(orient="records")
+    cprio = fetch_df("SELECT * FROM priorities_customers").to_dict(orient="records")
+    targets = fetch_df("SELECT * FROM priorities_targets").to_dict(orient="records")
+    jobs = fetch_df("SELECT id, customer, job, service, stage_completed, qty FROM jobs ORDER BY customer, job")
 
-    emp = fetch_df("SELECT id, name FROM employees WHERE id=?", (au["employee_id"],)) if au.get("employee_id") else pd.DataFrame()
-    emp_name = emp.iloc[0]["name"] if not emp.empty else None
-    if not emp_name:
-        st.warning("Your account is not linked to an employee record yet. Ask an admin to link it in User Management.")
-    tabs = st.tabs(["My Availability", "My Schedule", "Active Jobs", "Master Schedule"])
+    cfg = {
+        "window": {"start": gs["window_start"], "end": gs["window_end"]},
+        "rules": {
+            "gap_after_finish_hours": float(gs["gap_after_finish_hours"]),
+            "gap_before_assembly_hours": float(gs["gap_before_assembly_hours"]),
+            "assembly_earliest_hour": int(gs["assembly_earliest_hour"]),
+        },
+        "employees": [],
+        "priorities": {"customers": {}, "targets": []},
+        "special_projects": []
+    }
+    # Employees
+    for e in emp:
+        abilities = []
+        if e["can_prep"]: abilities.append("prep")
+        if e["can_finish"]: abilities.append("finishing")
+        my_shifts = [s for s in shifts if s["employee_id"]==e["id"]]
+        shift_list = [{"days":[int(s["weekday"])],"start":str(s["start"]), "end":str(s["end"])} for s in my_shifts]
+        my_offs = [o for o in offs if o["employee_id"]==e["id"]]
+        days_off = [str(o["off_date"]) for o in my_offs]
+        cfg["employees"].append({
+            "name": e["name"],
+            "abilities": abilities,
+            "shifts": shift_list,
+            "days_off": days_off
+        })
+    for p in cprio:
+        cfg["priorities"]["customers"][p["customer"]] = float(p["weight"])
+    for t in targets:
+        cfg["priorities"]["targets"].append({"customer": t["customer"], "stage": t["stage"], "by": t["by_date"]+" 00:00"})
+    for sp in sps:
+        emp_name = fetch_df("SELECT name FROM employees WHERE id=?", (sp["employee_id"],)).iloc[0]["name"]
+        cfg["special_projects"].append({"employee": emp_name, "start": sp["start_ts"], "end": sp["end_ts"], "label": sp["label"]})
+
+    # Dictionary temp path
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", encoding="utf-8") as tdf:
+        tdf.write(DICT_CSV)
+        dict_path = tdf.name
+
+    # Build forecast-like CSV
+    jobs2 = jobs.copy()
+    jobs2["Job"] = jobs2.apply(lambda r: (f"{int(r['qty'])} {r['job']}" if int(r["qty"])>1 else r["job"]), axis=1)
+    jobs2["Service"] = jobs2["service"]
+    jobs2["Stage"] = jobs2["stage_completed"]
+    jobs2["Customer"] = jobs2["customer"]
+    tmp_fore = tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", encoding="utf-8")
+    jobs2[["Customer","Job","Service","Stage"]].to_csv(tmp_fore.name, index=False)
+
+    service_blocks, service_stage_orders = ark.load_service_blocks(dict_path)
+    job_instances, unsched = ark.build_job_instances(tmp_fore.name, service_blocks, service_stage_orders)
+    df = ark.schedule_jobs(cfg, job_instances, service_stage_orders)
+    v2, v12 = ark.validate_schedule(df, cfg["rules"]["gap_after_finish_hours"], cfg["rules"]["gap_before_assembly_hours"])
+    return df, v2, v12, cfg
+
+def run_scheduler_view(editable: bool):
+    st.subheader("Generate Schedule" if editable else "Schedule (Read‑only)")
+    st.caption("Uses the embedded Production Hour Dictionary.")
+    if st.button("Run Scheduler" if editable else "Refresh Schedule", type="primary"):
+        df, v2, v12, cfg = build_runtime_cfg_and_schedule()
+        st.success(f"Schedule built. 2h-gap violations={v2}, 12h-before-assembly violations={v12}")
+        if not df.empty:
+            st.markdown("### Master Schedule (first 300 rows)")
+            st.dataframe(df.head(300))
+            if editable:
+                csv_bytes = df.to_csv(index=False).encode("utf-8")
+                st.download_button("Download master schedule.csv", data=csv_bytes, file_name="schedule_master.csv", mime="text/csv")
+            st.markdown("### Hours by Worker")
+            st.dataframe(df.groupby("Assigned To")["Hours"].sum().round(2).reset_index())
+            # Per-employee
+            st.markdown("### Per‑Employee Schedules")
+            workers = sorted(df["Assigned To"].dropna().unique().tolist())
+            if workers:
+                emp_tabs = st.tabs(workers)
+                for i, w in enumerate(workers):
+                    with emp_tabs[i]:
+                        wdf = df[df["Assigned To"]==w].copy()
+                        st.dataframe(wdf)
+                        if editable:
+                            wcsv = wdf.to_csv(index=False).encode("utf-8")
+                            st.download_button(f"Download {w} schedule.csv", data=wcsv, file_name=f"schedule_{w}.csv", mime="text/csv")
+        else:
+            st.info("No rows scheduled yet.")
+
+def employee_app(user):
+    st.title("ARK Production Scheduler — Employee")
+    emp_id = user.get("employee_id")
+    if emp_id is None:
+        st.warning("Your account is not linked to an employee record. Ask an admin to link your account.")
+        return
+    # Fetch employee name
+    emp_row = fetch_df("SELECT * FROM employees WHERE id=?", (emp_id,))
+    if emp_row.empty:
+        st.warning("Linked employee record not found."); return
+    emp_name = emp_row["name"].iloc[0]
+    # Tabs
+    tabs = st.tabs(["My Availability", "My Schedule", "Active Jobs", "Master Schedule (view)"])
 
     # My Availability
     with tabs[0]:
-        if emp_name:
-            st.subheader(f"Availability for {emp_name}")
-            shifts = fetch_df("""SELECT weekday, start, end FROM employee_shifts WHERE employee_id=? ORDER BY weekday""", (au["employee_id"],))
-            if not shifts.empty:
-                shifts["weekday"] = shifts["weekday"].map({0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"})
-            st.markdown("**Shifts**")
-            st.dataframe(shifts)
-            offs = fetch_df("SELECT off_date FROM employee_days_off WHERE employee_id=? ORDER BY off_date", (au["employee_id"],))
-            st.markdown("**Days Off**")
-            st.dataframe(offs)
-        else:
-            st.info("No linked employee record.")
+        st.subheader(f"Availability — {emp_name}")
+        shifts = fetch_df("SELECT weekday, start, end FROM employee_shifts WHERE employee_id=? ORDER BY weekday", (emp_id,))
+        if not shifts.empty:
+            shifts["weekday"] = shifts["weekday"].map({0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"})
+        st.markdown("**Shifts**")
+        st.dataframe(shifts)
+        offs = fetch_df("SELECT off_date FROM employee_days_off WHERE employee_id=? ORDER BY off_date", (emp_id,))
+        st.markdown("**Days Off**")
+        st.dataframe(offs)
+        sps = fetch_df("SELECT label, start_ts, end_ts FROM special_projects WHERE employee_id=? ORDER BY start_ts", (emp_id,))
+        st.markdown("**Special Projects**")
+        st.dataframe(sps)
 
-    # My Schedule
+    # My Schedule (computed)
     with tabs[1]:
-        st.subheader("My Scheduled Tasks")
-        df = run_scheduler_cached()
-        if df is None or df.empty:
-            st.info("No schedule generated yet. Ask an admin to run the scheduler.")
+        st.subheader("My Schedule")
+        df, v2, v12, cfg = build_runtime_cfg_and_schedule()
+        my = df[df["Assigned To"]==emp_name].copy()
+        if my.empty:
+            st.info("No scheduled tasks yet.")
         else:
-            wdf = df[df["Assigned To"]==emp_name] if emp_name else pd.DataFrame()
-            st.dataframe(wdf)
-            if not wdf.empty:
-                wcsv = wdf.to_csv(index=False).encode("utf-8")
-                st.download_button(f"Download my schedule.csv", data=wcsv, file_name=f"schedule_{emp_name or 'me'}.csv", mime="text/csv")
+            st.dataframe(my)
+            st.caption(f"Validation: 2h-gap violations={v2}, 12h-before-assembly violations={v12}")
+            wcsv = my.to_csv(index=False).encode("utf-8")
+            st.download_button(f"Download my schedule.csv", data=wcsv, file_name=f"schedule_{emp_name}.csv", mime="text/csv")
 
-    # Active Jobs (read-only)
+    # Active Jobs (all jobs; optionally filter to jobs where this employee has assignments)
     with tabs[2]:
         st.subheader("Active Jobs")
         jobs = fetch_df("SELECT customer, job, service, stage_completed, qty FROM jobs ORDER BY customer, job")
+        # Mark jobs where this employee has assignments
+        df, _, _, _ = build_runtime_cfg_and_schedule()
+        assigned_jobs = set(df[df["Assigned To"]==emp_name].apply(lambda r: (r["Customer"], r["Job"], r["Service"]), axis=1).tolist())
+        jobs["Assigned to me?"] = jobs.apply(lambda r: ("Yes" if ((r["customer"], r["job"] if int(r["qty"])==1 else f"{int(r['qty'])} {r['job']}", r["service"]) in assigned_jobs) else "No"), axis=1)
         st.dataframe(jobs)
 
-    # Master Schedule
+    # Master Schedule (view only)
     with tabs[3]:
-        st.subheader("Master Schedule (read-only)")
-        df = run_scheduler_cached()
-        if df is None or df.empty:
-            st.info("No schedule generated yet. Ask an admin to run the scheduler.")
+        st.subheader("Master Schedule (view only)")
+        df, v2, v12, cfg = build_runtime_cfg_and_schedule()
+        if df.empty:
+            st.info("No scheduled tasks.")
         else:
             st.dataframe(df.head(500))
-            csv_bytes = df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download master schedule.csv", data=csv_bytes, file_name="schedule_master.csv", mime="text/csv")
+            st.caption(f"Validation: 2h-gap violations={v2}, 12h-before-assembly violations={v12}")
 
-# -------------------- Shared scheduling helpers --------------------
-@st.cache_data(show_spinner=False, ttl=60)
-def run_scheduler_cached():
-    try:
-        gs = fetch_df("SELECT * FROM global_settings WHERE id=1")
-        if gs.empty:
-            return None
-        gs = gs.iloc[0].to_dict()
-        emp = fetch_df("SELECT * FROM employees ORDER BY name").to_dict(orient="records")
-        shifts = fetch_df("SELECT * FROM employee_shifts").to_dict(orient="records")
-        offs = fetch_df("SELECT * FROM employee_days_off").to_dict(orient="records")
-        sps = fetch_df("SELECT * FROM special_projects").to_dict(orient="records")
-        cprio = fetch_df("SELECT * FROM priorities_customers").to_dict(orient="records")
-        targets = fetch_df("SELECT * FROM priorities_targets").to_dict(orient="records")
-
-        cfg = {
-            "window": {"start": gs["window_start"], "end": gs["window_end"]},
-            "rules": {
-                "gap_after_finish_hours": float(gs["gap_after_finish_hours"]),
-                "gap_before_assembly_hours": float(gs["gap_before_assembly_hours"]),
-                "assembly_earliest_hour": int(gs["assembly_earliest_hour"]),
-            },
-            "employees": [],
-            "priorities": {"customers": {}, "targets": []},
-            "special_projects": []
-        }
-        for e in emp:
-            abilities = []
-            if e["can_prep"]: abilities.append("prep")
-            if e["can_finish"]: abilities.append("finishing")
-            my_shifts = [s for s in shifts if s["employee_id"]==e["id"]]
-            shift_list = [{"days":[int(s["weekday"])],"start":str(s["start"]), "end":str(s["end"])} for s in my_shifts]
-            my_offs = [o for o in offs if o["employee_id"]==e["id"]]
-            days_off = [str(o["off_date"]) for o in my_offs]
-            cfg["employees"].append({
-                "name": e["name"],
-                "abilities": abilities,
-                "shifts": shift_list,
-                "days_off": days_off
-            })
-        for p in cprio:
-            cfg["priorities"]["customers"][p["customer"]] = float(p["weight"])
-        for t in targets:
-            cfg["priorities"]["targets"].append({"customer": t["customer"], "stage": t["stage"], "by": t["by_date"]+" 00:00"})
-        for sp in sps:
-            emp_name = fetch_df("SELECT name FROM employees WHERE id=?", (sp["employee_id"],)).iloc[0]["name"]
-            cfg["special_projects"].append({"employee": emp_name, "start": sp["start_ts"], "end": sp["end_ts"], "label": sp["label"]})
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", encoding="utf-8") as tdf:
-            tdf.write(DICT_CSV)
-            dict_path = tdf.name
-
-        jobs = fetch_df("SELECT customer, job, service, stage_completed, qty FROM jobs ORDER BY customer, job")
-        if jobs.empty:
-            return pd.DataFrame()
-        jobs["Job"] = jobs.apply(lambda r: (f"{int(r['qty'])} {r['job']}" if int(r["qty"])>1 else r["job"]), axis=1)
-        jobs["Service"] = jobs["service"]
-        jobs["Stage"] = jobs["stage_completed"]
-        jobs["Customer"] = jobs["customer"]
-        tmp_fore = tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", encoding="utf-8")
-        jobs[["Customer","Job","Service","Stage"]].to_csv(tmp_fore.name, index=False)
-
-        service_blocks, service_stage_orders = ark.load_service_blocks(dict_path)
-        job_instances, unsched = ark.build_job_instances(tmp_fore.name, service_blocks, service_stage_orders)
-        df = ark.schedule_jobs(cfg, job_instances, service_stage_orders)
-        return df
-    except Exception:
-        return None
-
-def run_and_display_schedule():
-    df = run_scheduler_cached()
-    if df is None or df.empty:
-        st.info("No schedule generated (check jobs/employees/shifts/rules).")
-        return
-    st.markdown("### Master Schedule")
-    st.dataframe(df.head(500))
-
-    st.markdown("### Hours by Worker")
-    st.dataframe(df.groupby("Assigned To")["Hours"].sum().round(2).reset_index())
-
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download master schedule.csv", data=csv_bytes, file_name="schedule_master.csv", mime="text/csv")
-
-    st.markdown("### Per‑Employee Schedules")
-    workers = sorted(df["Assigned To"].dropna().unique().tolist())
-    if workers:
-        emp_tabs = st.tabs(workers)
-        for i, w in enumerate(workers):
-            with emp_tabs[i]:
-                wdf = df[df["Assigned To"]==w].copy()
-                st.dataframe(wdf)
-                wcsv = wdf.to_csv(index=False).encode("utf-8")
-                st.download_button(f"Download {w} schedule.csv", data=wcsv, file_name=f"schedule_{w}.csv", mime="text/csv")
-
-# -------------------- User Management (admin) --------------------
-def user_management_view():
-    st.subheader("User Management")
-    st.markdown("Create **admin** or **employee** accounts. Employees can be linked to an employee record for personalized schedules.")
-
-    # Create user
-    with st.form("create_user"):
-        c1,c2 = st.columns(2)
-        name = c1.text_input("Name")
-        email = c2.text_input("Email")
-        role = st.selectbox("Role", ["admin","employee"])
-        emp_list = fetch_df("SELECT id, name FROM employees ORDER BY name")
-        link_emp = st.selectbox("Link to employee (optional)", ["(none)"] + emp_list["name"].tolist())
-        pw = st.text_input("Temp password", type="password")
-        ok = st.form_submit_button("Create user")
-        if ok:
-            if not (name.strip() and email.strip() and pw.strip()):
-                st.warning("Name, email, and password are required.")
-            else:
-                try:
-                    pwh = hash_password(pw.strip())
-                    emp_id = None
-                    if link_emp != "(none)":
-                        emp_id = int(emp_list.loc[emp_list["name"]==link_emp, "id"].values[0])
-                    conn = get_conn(); cur = conn.cursor()
-                    cur.execute("""INSERT INTO users(name,email,role,password_hash,employee_id,active)
-                                   VALUES (?,?,?,?,?,1)""", (name.strip(), email.strip().lower(), role, pwh, emp_id))
-                    conn.commit(); conn.close()
-                    st.success(f"Created {role} account for {name}.")
-                except Exception as e:
-                    st.error(f"Could not create user: {e}")
-
-    # Users table
-    users = fetch_df("""SELECT u.id, u.name, u.email, u.role, u.active, e.name as employee
-                        FROM users u LEFT JOIN employees e ON e.id=u.employee_id
-                        ORDER BY u.role, u.name""")
-    st.dataframe(users)
-
-    # Reset password / deactivate / relink
-    if not users.empty:
-        with st.form("manage_user"):
-            uid = st.selectbox("User", users["id"].tolist())
-            action = st.selectbox("Action", ["Reset password","Deactivate","Activate","Link to employee","Unlink employee"])
-            emp_list = fetch_df("SELECT id, name FROM employees ORDER BY name")
-            link_to = st.selectbox("Employee to link", ["(none)"] + emp_list["name"].tolist())
-            new_pw = st.text_input("New password (for reset)", type="password")
-            ok2 = st.form_submit_button("Apply")
-            if ok2:
-                try:
-                    conn = get_conn(); cur = conn.cursor()
-                    if action == "Reset password":
-                        if not new_pw.strip():
-                            st.warning("Enter a new password."); conn.close()
-                        else:
-                            pwh = hash_password(new_pw.strip())
-                            cur.execute("UPDATE users SET password_hash=? WHERE id=?", (pwh, int(uid)))
-                            conn.commit(); conn.close(); st.success("Password reset.")
-                    elif action == "Deactivate":
-                        cur.execute("UPDATE users SET active=0 WHERE id=?", (int(uid),))
-                        conn.commit(); conn.close(); st.success("User deactivated.")
-                    elif action == "Activate":
-                        cur.execute("UPDATE users SET active=1 WHERE id=?", (int(uid),))
-                        conn.commit(); conn.close(); st.success("User activated.")
-                    elif action == "Link to employee":
-                        if link_to == "(none)":
-                            st.warning("Choose an employee to link."); conn.close()
-                        else:
-                            emp_id = int(emp_list.loc[emp_list["name"]==link_to, "id"].values[0])
-                            cur.execute("UPDATE users SET employee_id=? WHERE id=?", (emp_id, int(uid)))
-                            conn.commit(); conn.close(); st.success("Linked to employee.")
-                    elif action == "Unlink employee":
-                        cur.execute("UPDATE users SET employee_id=NULL WHERE id=?", (int(uid),))
-                        conn.commit(); conn.close(); st.success("Unlinked from employee.")
-                except Exception as e:
-                    st.error(f"Action failed: {e}")
-
-# -------------------- Main entry --------------------
+# -------------------- App router --------------------
 def main():
-    au = st.session_state["auth_user"]
-    if not au:
-        login_view()
+    # Auth bootstrap or login
+    if not users_exist():
+        bootstrap_admin()
         return
-    if au["role"] == "admin":
+    logout_button()
+    if "auth" not in st.session_state:
+        login_form()
+        return
+
+    user = st.session_state["auth"]
+    role = user.get("role", "employee")
+
+    if role == "admin":
         admin_app()
     else:
-        employee_app()
+        employee_app(user)
 
 if __name__ == "__main__":
     main()
