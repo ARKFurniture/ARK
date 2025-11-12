@@ -25,7 +25,7 @@ def verify_password(password: str, stored: str) -> bool:
     except Exception:
         return False
 
-# -------------------- Dictionary helpers (service stage orders & piece types) --------------------
+# -------------------- Dictionary helpers --------------------
 import tempfile
 def get_dict_struct():
     with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", encoding="utf-8") as tdf:
@@ -144,6 +144,15 @@ def init_db():
         active INTEGER NOT NULL DEFAULT 1
     );
     """)
+    # Pre-seed requested admin if not present
+    cur.execute("SELECT id FROM users WHERE email=?", ('info@arkfurniture.ca',))
+    row = cur.fetchone()
+    if row is None:
+        # name from workspace metadata; role admin; password 'password'
+        pwh = hash_password("password")
+        cur.execute("""INSERT INTO users(name,email,role,password_hash,employee_id,active)
+                       VALUES (?,?,?,?,?,1)""",
+                    ("Kyle Babineau","info@arkfurniture.ca","admin",pwh,None))
     conn.commit()
     conn.close()
 
@@ -197,6 +206,28 @@ def top_bar():
     au = st.session_state["auth_user"]
     if not au: return
     st.sidebar.markdown(f"**Signed in as:** {au['name']}  \n**Role:** {au['role']}")
+    # Self-serve change password
+    with st.sidebar.expander("Change password"):
+        cur_pw = st.text_input("Current password", type="password", key="cp_cur")
+        new_pw = st.text_input("New password", type="password", key="cp_new")
+        new_pw2 = st.text_input("Confirm new password", type="password", key="cp_new2")
+        if st.button("Update password", key="cp_btn"):
+            if not new_pw or new_pw != new_pw2:
+                st.warning("New passwords do not match.")
+            else:
+                try:
+                    conn = get_conn(); cur = conn.cursor()
+                    cur.execute("SELECT password_hash FROM users WHERE id=?", (au["id"],))
+                    row = cur.fetchone()
+                    if not row or not verify_password(cur_pw or "", row[0]):
+                        st.error("Current password is incorrect.")
+                    else:
+                        pwh = hash_password(new_pw)
+                        cur.execute("UPDATE users SET password_hash=? WHERE id=?", (pwh, au["id"]))
+                        conn.commit(); conn.close()
+                        st.success("Password updated.")
+                except Exception as e:
+                    st.error(f"Could not change password: {e}")
     if st.sidebar.button("Sign out"):
         st.session_state["auth_user"] = None
         st.experimental_rerun()
@@ -498,9 +529,7 @@ def employee_app():
 # -------------------- Shared scheduling helpers --------------------
 @st.cache_data(show_spinner=False, ttl=60)
 def run_scheduler_cached():
-    # Build config from DB and run scheduler; cached for 60s
     try:
-        # Settings
         gs = fetch_df("SELECT * FROM global_settings WHERE id=1")
         if gs.empty:
             return None
@@ -549,7 +578,6 @@ def run_scheduler_cached():
             tdf.write(DICT_CSV)
             dict_path = tdf.name
 
-        # Build forecast-like CSV from jobs
         jobs = fetch_df("SELECT customer, job, service, stage_completed, qty FROM jobs ORDER BY customer, job")
         if jobs.empty:
             return pd.DataFrame()
