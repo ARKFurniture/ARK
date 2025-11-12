@@ -323,7 +323,7 @@ def admin_app():
                 except Exception as e:
                     st.error(f"Could not add employee: {e}")
 
-        emp_df = fetch_df("SELECT * FROM employees ORDER BY name ASC")
+        emp_df = fetch_df("SELECT * FROM employees ORDER BY id ASC")
         st.dataframe(emp_df)
 
         st.markdown("### Add Shift")
@@ -364,19 +364,25 @@ def admin_app():
                         st.error(f"Could not delete shift: {e}")
 
         if not emp_df.empty:
+            
+            
             with st.form("del_employee"):
                 st.markdown("**Delete an employee** (cascades to shifts/days-off/projects)")
-                # ID-safe: use employee id as the value; build a readable label from whatever columns exist
-                if "id" in emp_df.columns:
-                    emp_ids = emp_df["id"].astype(int).tolist()
-                    _emap = {int(r["id"]): (r if isinstance(r, dict) else r.to_dict()) for _, r in emp_df.iterrows()}
-                    def _emp_fmt(rid):
-                        row = _emap.get(int(rid), {})
-                        nm = row.get("name", "Employee")
-                        rl = row.get("role", "")
-                        em = row.get("email", "")
-                        return f"{nm} · {rl} · {em}  (#{rid})"
-                    sel_emp_id = st.selectbox("Employee", options=emp_ids, format_func=_emp_fmt, key="emp_delete_select")
+                if "id" not in emp_df.columns or emp_df.empty:
+                    st.info("No employees to delete.")
+                else:
+                    _cols = [c for c in ["id","name","role","email"] if c in emp_df.columns]
+                    _emp_map = {int(r["id"]): r.to_dict() for _, r in emp_df[_cols].iterrows()}
+                    emp_ids = sorted(_emp_map.keys())
+                    def _fmt_emp(rid:int)->str:
+                        row = _emp_map.get(int(rid), {})
+                        name = str(row.get("name","")).strip()
+                        role = str(row.get("role","")).strip()
+                        email = str(row.get("email","")).strip()
+                        parts = [p for p in [name, role, email] if p]
+                        label = " · ".join(parts) if parts else f"Employee #{rid}"
+                        return f"{label}  (#{rid})"
+                    sel_emp_id = st.selectbox("Employee", options=emp_ids, format_func=_fmt_emp, key="emp_delete_select")
                     confirm = st.checkbox("Type DELETE below and check this", value=False, key="emp_del_chk")
                     text_confirm = st.text_input("Type: DELETE to confirm", "", key="emp_del_text")
                     if st.form_submit_button("Delete employee"):
@@ -389,16 +395,9 @@ def admin_app():
                                 st.error(f"Could not delete employee: {e}")
                         else:
                             st.warning("Please confirm deletion by typing DELETE and checking the box.")
-                # Fallback if schema has no id (unlikely): delete by name exactly as selected
-                else:
-                    del_name = st.selectbox("Employee", emp_df.iloc[:,0].astype(str).tolist())
-                    if st.form_submit_button("Delete employee by name"):
-                        try:
-                            execute("DELETE FROM employees WHERE name=?", (del_name,))
-                            st.success(f"Deleted employee: {del_name}")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Could not delete employee: {e}")
+
+
+    # Jobs
     with tabs[1]:
         st.subheader("Jobs")
         svc = st.selectbox("Service", SERVICES, index=0, key="job_service")
@@ -418,105 +417,29 @@ def admin_app():
                     st.error(f"Could not add job: {e}")
             else:
                 st.warning("Customer is required.")
-
-        with st.expander("Bulk add jobs from CSV", expanded=False):
-            up = st.file_uploader("Upload CSV of jobs", type=["csv"], key="jobs_csv_upload")
-            if up is not None:
-                try:
-                    import pandas as pd
-                    csv_df = pd.read_csv(up)
-                except Exception as e:
-                    st.error(f"Could not read CSV: {e}")
-                    csv_df = None
-                if csv_df is not None and not csv_df.empty:
-                    st.caption(f"Loaded {len(csv_df)} rows")
-                    cols = list(csv_df.columns)
-
-                    def _guess(*cands):
-                        lc = {c.lower().strip(): c for c in cols}
-                        for nm in cands:
-                            if nm in lc: return lc[nm]
-                        return None
-
-                    col_customer = st.selectbox("Customer column", ["<none>"] + cols, index=(["<none>"]+cols).index(_guess("customer","client","name")) if _guess("customer","client","name") else 0)
-                    col_piece    = st.selectbox("Job/Piece column", ["<none>"] + cols, index=(["<none>"]+cols).index(_guess("job","piece","item","type")) if _guess("job","piece","item","type") else 0)
-                    col_service  = st.selectbox("Service column", ["<none>"] + cols, index=(["<none>"]+cols).index(_guess("service")) if _guess("service") else 0)
-                    col_stage    = st.selectbox("Stage column", ["<none>"] + cols, index=(["<none>"]+cols).index(_guess("stage","stage_completed","status")) if _guess("stage","stage_completed","status") else 0)
-                    col_qty      = st.selectbox("Quantity column", ["<none>"] + cols, index=(["<none>"]+cols).index(_guess("qty","quantity","count")) if _guess("qty","quantity","count") else 0)
-
-                    st.write("Defaults (used if the column is <none> or a value is missing):")
-                    d1, d2, d3 = st.columns(3)
-                    default_service = d1.selectbox("Default Service", SERVICES, index=0, key="csv_def_service")
-                    default_stage   = d2.selectbox("Default Stage", ["Not Started"] + SERVICE_STAGE_ORDERS.get(default_service, []), index=0, key="csv_def_stage")
-                    default_qty     = int(d3.number_input("Default Qty", value=1, min_value=1, step=1))
-
-                    skip_dupes = st.checkbox("Skip rows that look like duplicates (same Customer + Piece + Service + Stage + Qty)", value=True)
-
-                    # Build candidate rows
-                    preview_rows = []
-                    for _, r in csv_df.iterrows():
-                        cust = str(r[col_customer]).strip() if col_customer != "<none>" else ""
-                        piece = str(r[col_piece]).strip() if col_piece != "<none>" else ""
-                        svc   = str(r[col_service]).strip() if col_service != "<none>" else default_service
-                        stg   = str(r[col_stage]).strip() if col_stage != "<none>" else default_stage
-                        try:
-                            q     = int(r[col_qty]) if col_qty != "<none>" and str(r[col_qty]).strip() != "" else default_qty
-                        except Exception:
-                            q     = default_qty
-
-                        if not cust or not piece:
-                            # require at least customer and piece/job
-                            continue
-
-                        valid_stages = ["Not Started"] + SERVICE_STAGE_ORDERS.get(svc, [])
-                        if stg not in valid_stages:
-                            stg = "Not Started"
-
-                        preview_rows.append({
-                            "customer": cust, "job": piece, "service": svc, "stage_completed": stg, "qty": q
-                        })
-
-                    if not preview_rows:
-                        st.warning("No valid rows found (need at least Customer and Job/Piece).")
-                    else:
-                        import pandas as pd
-                        prev_df = pd.DataFrame(preview_rows)
-                        st.dataframe(prev_df)
-
-                        if st.button(f"Insert {len(preview_rows)} job(s)"):
-                            inserted = 0
-                            for row in preview_rows:
-                                try:
-                                    if skip_dupes:
-                                        dup = fetch_df(
-                                            "SELECT COUNT(*) as n FROM jobs WHERE customer=? AND job=? AND service=? AND stage_completed=? AND qty=?",
-                                            (row["customer"], row["job"], row["service"], row["stage_completed"], int(row["qty"]))
-                                        )
-                                        if not dup.empty and int(dup.iloc[0]["n"]) > 0:
-                                            continue
-                                    execute("INSERT INTO jobs(customer, job, service, stage_completed, qty) VALUES (?,?,?,?,?)",
-                                            (row["customer"], row["job"], row["service"], row["stage_completed"], int(row["qty"])))
-                                    inserted += 1
-                                except Exception as e:
-                                    st.error(f"Row not inserted for {row['customer']} {row['job']}: {e}")
-                            st.success(f"Inserted {inserted} job(s).")
-                            st.rerun()
-        try:
-            jobs_df = fetch_df("SELECT * FROM jobs ORDER BY id ASC")
-        except Exception:
-            jobs_df = fetch_df("SELECT * FROM jobs")
+        jobs_df = fetch_df("SELECT * FROM jobs ORDER BY id ASC")
         st.dataframe(jobs_df)
         if not jobs_df.empty:
+            
+            
             with st.form("del_job"):
                 st.markdown("**Delete a job**")
-                # ID-safe selection: value = job id
-                if "id" in jobs_df.columns:
-                    job_ids = jobs_df["id"].astype(int).tolist()
-                    _jmap = {int(r["id"]): (r if isinstance(r, dict) else r.to_dict()) for _, r in jobs_df.iterrows()}
-                    def _job_fmt(jid):
-                        row = _jmap.get(int(jid), {})
-                        return f"{row.get('customer', 'Customer')} | {row.get('qty', '')} x {row.get('job', '')} | {row.get('service', '')}  (#{jid})"
-                    sel_job_id = st.selectbox("Job", options=job_ids, format_func=_job_fmt, key="job_delete_select")
+                if "id" not in jobs_df.columns or jobs_df.empty:
+                    st.info("No jobs to delete.")
+                else:
+                    _cols = [c for c in ["id","customer","qty","job","service","piece"] if c in jobs_df.columns]
+                    _job_map = {int(r["id"]): r.to_dict() for _, r in jobs_df[_cols].iterrows()}
+                    job_ids = sorted(_job_map.keys())
+                    def _fmt_job(jid:int)->str:
+                        row = _job_map.get(int(jid), {})
+                        customer = str(row.get("customer","")).strip()
+                        qty = str(row.get("qty","")).strip()
+                        piece = str(row.get("job") or row.get("piece","")).strip()
+                        service = str(row.get("service","")).strip()
+                        parts = [p for p in [customer, f"{qty} x {piece}" if qty or piece else "", service] if p]
+                        label = " | ".join(parts) if parts else f"Job #{jid}"
+                        return f"{label}  (#{jid})"
+                    sel_job_id = st.selectbox("Job", options=job_ids, format_func=_fmt_job, key="job_delete_select")
                     if st.form_submit_button("Delete job"):
                         try:
                             execute("DELETE FROM jobs WHERE id=?", (int(sel_job_id),))
@@ -524,14 +447,120 @@ def admin_app():
                             st.rerun()
                         except Exception as e:
                             st.error(f"Could not delete job: {e}")
+
+
+# --- Import jobs from CSV ---
+        with st.expander("Import jobs from CSV", expanded=False):
+            st.caption("Columns supported: customer, job, service, qty, stage_completed, due_date, priority, notes")
+            template = (
+                "customer,job,service,qty,stage_completed,due_date,priority,notes\n"
+                "Nancy,Dining Chair,Restore,2,,2025-11-22,,\n"
+                "East House Design,Sideboard,Resurface,1,Prep,2025-11-23,1,Rush\n"
+            )
+            st.download_button("Download CSV template", data=template, file_name="jobs_template.csv", mime="text/csv", key="dl_jobs_template")
+
+            up = st.file_uploader("Upload CSV", type=["csv"], key="jobs_csv_upload")
+            dedup = st.checkbox("Skip duplicates (customer + job + service + stage + qty)", value=True, key="jobs_csv_dedup")
+
+            if up is not None:
+                import pandas as pd
+                try:
+                    df_csv = pd.read_csv(up)
+                except Exception as e:
+                    st.error(f"Could not read CSV: {e}")
                 else:
-                    label_col = jobs_df.columns[0]
-                    selection = st.selectbox("Job", jobs_df[label_col].astype(str).tolist())
-                    if st.form_submit_button("Delete job by label"):
-                        st.warning("Job delete requires an id column to be safe. Please ensure the schema includes an integer id.")
+                    # Normalize columns (case-insensitive)
+                    cols_lower = {c.lower(): c for c in df_csv.columns}
+                    def pick(*names):
+                        for n in names:
+                            if n in cols_lower: return cols_lower[n]
+                        return None
+
+                    c_customer = pick("customer","client","name")
+                    c_job      = pick("job","piece","item","furniture","piece_type")
+                    c_service  = pick("service","type","workflow","package")
+                    c_qty      = pick("qty","quantity","count","units","num")
+                    c_stage    = pick("stage_completed","stage","status")
+                    c_due      = pick("due_date","delivery","target","deadline")
+                    c_prio     = pick("priority","prio","rank")
+                    c_notes    = pick("notes","note","comments","comment")
+
+                    missing = [label for label, c in [("customer",c_customer),("job",c_job),("service",c_service),("qty",c_qty)] if c is None]
+                    if missing:
+                        st.error("Missing required columns: " + ", ".join(missing) + ". Rename your CSV columns or use the template.")
+                    else:
+                        # Schema detection for optional columns
+                        try:
+                            schema_df = fetch_df("PRAGMA table_info(jobs)")
+                            job_cols = set(schema_df["name"].tolist()) if "name" in schema_df.columns else set()
+                        except Exception:
+                            job_cols = set()
+
+                        st.write("Preview of parsed CSV (first 100 rows):")
+                        st.dataframe(df_csv.head(100), width='stretch')
+
+                        # Import button
+                        if st.button("Import jobs", type="primary", key="jobs_csv_import"):
+                            inserted = 0
+                            skipped = 0
+                            for idx, row in df_csv.iterrows():
+                                customer = str(row[c_customer]).strip()
+                                job_piece = str(row[c_job]).strip()
+                                service = str(row[c_service]).strip()
+                                qty_raw = row[c_qty]
+                                try:
+                                    qty = int(qty_raw) if str(qty_raw).strip() != "" else 1
+                                except Exception:
+                                    qty = 1
+                                stage_completed = (str(row[c_stage]).strip() if c_stage and not pd.isna(row[c_stage]) else "")
+                                due_date = (str(row[c_due]).strip() if c_due and not pd.isna(row[c_due]) else "")
+                                prio_val = row[c_prio] if c_prio and not pd.isna(row[c_prio]) else None
+                                notes = (str(row[c_notes]).strip() if c_notes and not pd.isna(row[c_notes]) else "")
+
+                                # Duplicate check (best-effort)
+                                if dedup:
+                                    try:
+                                        dup = fetch_df(
+                                            "SELECT id FROM jobs WHERE customer=? AND job=? AND service=? AND COALESCE(stage_completed,'')=? AND CAST(COALESCE(qty,1) AS INT)=?",
+                                            (customer, job_piece, service, stage_completed, int(qty))
+                                        )
+                                        if hasattr(dup, "empty") and not dup.empty:
+                                            skipped += 1
+                                            continue
+                                    except Exception:
+                                        pass
+
+                                # Build INSERT dynamically depending on schema
+                                cols = ["customer","job","service","qty"]
+                                vals = [customer, job_piece, service, int(qty)]
+                                if "stage_completed" in job_cols:
+                                    cols.append("stage_completed"); vals.append(stage_completed)
+                                if "due_date" in job_cols and due_date:
+                                    cols.append("due_date"); vals.append(due_date)
+                                if "priority" in job_cols and prio_val is not None and str(prio_val).strip() != "":
+                                    try:
+                                        vals_prio = int(prio_val)
+                                    except Exception:
+                                        vals_prio = None
+                                    if vals_prio is not None:
+                                        cols.append("priority"); vals.append(vals_prio)
+                                if "notes" in job_cols and notes:
+                                    cols.append("notes"); vals.append(notes)
+
+                                placeholders = ",".join(["?"]*len(vals))
+                                try:
+                                    execute(f"INSERT INTO jobs({','.join(cols)}) VALUES ({placeholders})", tuple(vals))
+                                    inserted += 1
+                                except Exception as e:
+                                    st.error(f"Row {idx+1} failed: {e}")
+
+                            st.success(f"Imported {inserted} jobs. Skipped {skipped} duplicates.")
+                            st.rerun()
+
+    # Special Projects
     with tabs[2]:
         st.subheader("Special Projects (blocks time)")
-        emp_df = fetch_df("SELECT * FROM employees ORDER BY name ASC")
+        emp_df = fetch_df("SELECT * FROM employees ORDER BY id ASC")
         if emp_df.empty:
             st.info("Add at least one employee first.")
         else:
@@ -559,32 +588,28 @@ def admin_app():
                             FROM special_projects sp JOIN employees e ON e.id=sp.employee_id
                             ORDER BY sp.start_ts""")
         st.dataframe(sp_df)
-        # Delete special project block (ID-safe)
-        if not sp_df.empty and "id" in sp_df.columns:
-            sp_ids = sp_df["id"].astype(int).tolist()
-            _smap = {int(r["id"]): (r if isinstance(r, dict) else r.to_dict()) for _, r in sp_df.iterrows()}
-            def _sp_fmt(sid):
-                row = _smap.get(int(sid), {})
-                return f"{row.get('employee', 'Employee')} | {row.get('label', '')} | {row.get('start_ts', '')} → {row.get('end_ts', '')}  (#{sid})"
+        # Delete special project block
+        if not sp_df.empty:
             with st.form("del_sp"):
-                sel_sp_id = st.selectbox("Special project", options=sp_ids, format_func=_sp_fmt, key="sp_delete_select")
+                st.markdown("**Delete a special project block**")
+                sp_df2 = sp_df.copy()
+                options = sp_df2["id"].astype(int).tolist()
+                id_to_label = {int(r["id"]): f"{int(r['id'])} – {r['employee']} | {r['label']} | {r['start_ts']} → {r['end_ts']}" for _, r in sp_df2.iterrows()}
+                sel_sp_id = st.selectbox("Special project", options=options, format_func=lambda rid: id_to_label.get(int(rid), f"#{rid}"), key="sp_delete_select")
                 confirm_sp = st.checkbox("Confirm delete", value=False, key="sp_del_chk")
-                if st.form_submit_button("Delete block"):
-                    if confirm_sp:
-                        try:
-                            execute("DELETE FROM special_projects WHERE id=?", (int(sel_sp_id),))
-                            st.success(f"Deleted special project id {int(sel_sp_id)}")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Could not delete special project: {e}")
-                    else:
-                        st.warning("Please confirm deletion.")
+                if st.form_submit_button("Delete block") and confirm_sp and sel_sp_id:
+                    try:
+                        execute("DELETE FROM special_projects WHERE id=?", (int(sel_sp_id),))
+                        st.success(f"Deleted special project id {int(sel_sp_id)}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not delete special project: {e}")
 
 
     # Time Off
     with tabs[3]:
         st.subheader("Time Off (full days)")
-        emp_df = fetch_df("SELECT * FROM employees ORDER BY name ASC")
+        emp_df = fetch_df("SELECT * FROM employees ORDER BY id ASC")
         if emp_df.empty:
             st.info("Add at least one employee first.")
         else:
@@ -769,6 +794,21 @@ def run_scheduler_cached():
             cfg["priorities"]["customers"][p["customer"]] = float(p["weight"])
         for t in targets:
             cfg["priorities"]["targets"].append({"customer": t["customer"], "stage": t["stage"], "by": t["by_date"]+" 00:00"})
+        # --- Default customer ordering by job insertion (id ASC) when no explicit priorities ---
+        if (not cfg["priorities"]["customers"]) and (len(cfg["priorities"]["targets"]) == 0):
+            try:
+                _job_order = fetch_df("SELECT id, customer FROM jobs ORDER BY id ASC")
+                seen = set()
+                w = 1.0
+                for _, r in _job_order.iterrows():
+                    cust = str(r["customer"])
+                    if cust not in seen:
+                        cfg["priorities"]["customers"][cust] = w
+                        seen.add(cust)
+                        w += 1.0
+            except Exception:
+                pass
+
         for sp in sps:
             emp_name = fetch_df("SELECT name FROM employees WHERE id=?", (sp["employee_id"],)).iloc[0]["name"]
             cfg["special_projects"].append({"employee": emp_name, "start": sp["start_ts"], "end": sp["end_ts"], "label": sp["label"]})
