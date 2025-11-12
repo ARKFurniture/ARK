@@ -751,6 +751,166 @@ def employee_app():
             st.download_button("Download master schedule.csv", data=csv_bytes, file_name="schedule_master.csv", mime="text/csv")
 
 # -------------------- Shared scheduling helpers --------------------
+# -------------------- Non-preemptive schedule post-processor --------------------
+def enforce_non_preemptive_finish_started(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """
+    Enforce "finish-what-you-start" within each employee's day, with deadline-only override.
+    Does not preempt mid-stage; only reorders within the same day for the same employee.
+    If a deadline (Priorities → Targets) would be missed by finishing first, we keep original order.
+    """
+    if df is None or df.empty:
+        return df
+
+    # Column detection
+    def find_col(df, *cands):
+        cols = {c.lower(): c for c in df.columns}
+        for c in cands:
+            if c.lower() in cols:
+                return cols[c.lower()]
+        return None
+
+    c_emp  = find_col(df, "Assigned To", "Employee", "Worker")
+    c_sta  = find_col(df, "Start", "Start Time", "start")
+    c_end  = find_col(df, "End", "End Time", "end")
+    c_hrs  = find_col(df, "Hours", "Duration", "hours")
+    c_cust = find_col(df, "Customer", "customer", "Client")
+    c_job  = find_col(df, "Job", "job", "Piece")
+    c_srv  = find_col(df, "Service", "service", "Workflow")
+    c_stg  = find_col(df, "Stage", "stage", "Status")
+    c_item = find_col(df, "Item", "Qty Index", "Index")
+
+    req = [c_emp, c_sta, c_end, c_cust, c_job, c_srv, c_stg]
+    if any(c is None for c in req):
+        return df  # Best-effort: columns missing; skip
+
+    wdf = df.copy()
+    # Parse datetimes
+    wdf[c_sta] = pd.to_datetime(wdf[c_sta], errors="coerce")
+    wdf[c_end] = pd.to_datetime(wdf[c_end], errors="coerce")
+    if c_hrs is None:
+        wdf["__Hours__"] = (wdf[c_end] - wdf[c_sta]).dt.total_seconds()/3600.0
+        c_hours = "__Hours__"
+    else:
+        c_hours = c_hrs
+
+    # Build deadlines map from cfg.priorities.targets
+    import pandas as _pd
+    dl_map = {}  # key: (customer_lower, stage_lower) -> earliest deadline pd.Timestamp
+    try:
+        for t in (cfg or {}).get("priorities", {}).get("targets", []):
+            cust = str(t.get("customer","")).strip().lower()
+            stg  = str(t.get("stage","")).strip().lower()
+            by   = _pd.to_datetime(str(t.get("by","")), errors="coerce")
+            if _pd.isna(by):
+                continue
+            key = (cust, stg)
+            if key not in dl_map or by < dl_map[key]:
+                dl_map[key] = by
+    except Exception:
+        dl_map = {}
+
+    # Helper to build a task key (same piece-stage)
+    def task_key(row):
+        base = (str(row.get(c_cust,"")), str(row.get(c_job,"")), str(row.get(c_srv,"")), str(row.get(c_stg,"")))
+        if c_item and c_item in row:
+            return base + (str(row.get(c_item,"")),)
+        return base
+
+    out_rows = []
+
+    # Process per employee, per day
+    wdf = wdf.sort_values([c_emp, c_sta, c_end]).reset_index(drop=True)
+    for emp, sub in wdf.groupby(c_emp, sort=False):
+        if sub.empty:
+            continue
+        sub = sub.sort_values([c_sta, c_end]).copy()
+        sub["__day__"] = sub[c_sta].dt.date
+
+        for day, day_df in sub.groupby("__day__", sort=False):
+            if day_df.empty:
+                continue
+            day_df = day_df.sort_values([c_sta, c_end]).copy()
+
+            # Build queue of dict-rows
+            pending = [r._asdict() if hasattr(r, "_asdict") else r.to_dict() for _, r in day_df.iterrows()]
+            cursor = day_df.iloc[0][c_sta]
+
+            while pending:
+                r0 = pending.pop(0)
+                # Align cursor to at least this row's start
+                if pd.isna(r0[c_sta]) or pd.isna(r0[c_end]):
+                    # Skip invalid rows
+                    continue
+                start0 = max(cursor, r0[c_sta])
+                dur0_h = float(r0[c_hours]) if pd.notna(r0[c_hours]) else (r0[c_end] - r0[c_sta]).total_seconds()/3600.0
+                key0 = task_key(r0)
+
+                # Collect same-task fragments later in the day (non-preemptive merge)
+                same_idxs = []
+                total_h = dur0_h
+                for i in range(len(pending)):
+                    ri = pending[i]
+                    if task_key(ri) == key0:
+                        # Only same-day by construction
+                        dh = float(ri[c_hours]) if pd.notna(ri[c_hours]) else (ri[c_end] - ri[c_sta]).total_seconds()/3600.0
+                        same_idxs.append(i)
+                        total_h += dh
+
+                proposed_end = start0 + pd.Timedelta(hours=total_h)
+
+                # Check deadline-only override
+                violates_deadline = False
+                if dl_map:
+                    # If any other task between now and proposed_end has a deadline earlier than proposed_end,
+                    # do not merge the fragments; schedule only r0 now.
+                    for ri in pending:
+                        # If its scheduled start was before proposed_end (i.e., would be pushed), check target
+                        if pd.isna(ri[c_sta]):
+                            continue
+                        if ri[c_sta] < proposed_end:
+                            dkey = (str(ri.get(c_cust,"")).strip().lower(), str(ri.get(c_stg,"")).strip().lower())
+                            dl = dl_map.get(dkey)
+                            if dl is not None and dl < proposed_end:
+                                violates_deadline = True
+                                break
+
+                if violates_deadline:
+                    # Keep just r0 as-is (adjusted to cursor)
+                    end0 = start0 + pd.Timedelta(hours=dur0_h)
+                    rr = dict(r0)
+                    rr[c_sta] = start0
+                    rr[c_end] = end0
+                    rr[c_hours] = dur0_h
+                    out_rows.append(rr)
+                    cursor = end0
+                    # keep the same-task fragments for later (no removal)
+                else:
+                    # Remove the same-task fragments from pending (consume them into this merged block)
+                    for idx in sorted(same_idxs, reverse=True):
+                        pending.pop(idx)
+                    # Compose merged row
+                    endm = proposed_end
+                    rr = dict(r0)
+                    rr[c_sta] = start0
+                    rr[c_end] = endm
+                    rr[c_hours] = total_h
+                    out_rows.append(rr)
+                    cursor = endm
+
+    out = pd.DataFrame(out_rows) if out_rows else wdf
+    # Ensure Hours recomputed precisely if needed
+    try:
+        out[c_hours] = (pd.to_datetime(out[c_end]) - pd.to_datetime(out[c_sta])).dt.total_seconds()/3600.0
+    except Exception:
+        pass
+    # Sort consistently
+    out = out.sort_values([c_emp, c_sta, c_end]).reset_index(drop=True)
+    # Restore original column order
+    cols = df.columns.tolist()
+    extra = [c for c in out.columns if c not in cols]
+    out = out[[c for c in cols if c in out.columns] + extra]
+    return out
+
 @st.cache_data(show_spinner=False, ttl=60)
 def run_scheduler_cached():
     try:
@@ -771,10 +931,7 @@ def run_scheduler_cached():
                 "gap_after_finish_hours": float(gs["gap_after_finish_hours"]),
                 "gap_before_assembly_hours": float(gs["gap_before_assembly_hours"]),
                 "assembly_earliest_hour": int(gs["assembly_earliest_hour"]),
-                        "non_preemptive": true,
-            "preempt_only_for_deadlines": true,
-            "min_block_minutes": 0
-},
+            },
             "employees": [],
             "priorities": {"customers": {}, "targets": []},
             "special_projects": []
@@ -833,6 +990,10 @@ def run_scheduler_cached():
         service_blocks, service_stage_orders = ark.load_service_blocks(dict_path)
         job_instances, unsched = ark.build_job_instances(tmp_fore.name, service_blocks, service_stage_orders)
         df = ark.schedule_jobs(cfg, job_instances, service_stage_orders)
+        try:
+            df = enforce_non_preemptive_finish_started(df, cfg)
+        except Exception:
+            pass
         return df
     except Exception:
         return None
