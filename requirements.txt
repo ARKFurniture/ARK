@@ -1,2 +1,5 @@
-streamlit==1.31.1\n
+streamlit>=1.51,<1.52
+pandas>=2.0.0
+numpy>=1.25.0
+bcrypt>=4.0.1
 plotly>=5.22.0
