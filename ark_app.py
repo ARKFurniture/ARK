@@ -771,7 +771,10 @@ def run_scheduler_cached():
                 "gap_after_finish_hours": float(gs["gap_after_finish_hours"]),
                 "gap_before_assembly_hours": float(gs["gap_before_assembly_hours"]),
                 "assembly_earliest_hour": int(gs["assembly_earliest_hour"]),
-            },
+                        "non_preemptive": true,
+            "preempt_only_for_deadlines": true,
+            "min_block_minutes": 0
+},
             "employees": [],
             "priorities": {"customers": {}, "targets": []},
             "special_projects": []
