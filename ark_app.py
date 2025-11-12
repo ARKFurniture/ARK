@@ -2,7 +2,7 @@
 import streamlit as st
 import pandas as pd
 import json, os, sqlite3, tempfile, hashlib, binascii
-from datetime import date
+from datetime import datetime, date
 import ark_scheduler as ark
 from ark_dictionary import DICT_CSV
 
@@ -10,12 +10,13 @@ st.set_page_config(page_title="ARK Production Scheduler", layout="wide")
 
 # -------------------- Auth utilities --------------------
 def hash_password(password: str, iterations: int = 200_000) -> str:
-    # Salted PBKDF2-SHA256
+    """Return a salted PBKDF2-SHA256 hash string for the given password."""
     salt = os.urandom(16)
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
     return f"pbkdf2_sha256${iterations}${binascii.hexlify(salt).decode()}${binascii.hexlify(dk).decode()}"
 
 def verify_password(password: str, stored: str) -> bool:
+    """Verify a password against a stored PBKDF2-SHA256 hash string."""
     try:
         algo, iter_str, salt_hex, hash_hex = stored.split("$", 3)
         iterations = int(iter_str)
@@ -27,12 +28,11 @@ def verify_password(password: str, stored: str) -> bool:
 
 # -------------------- Dictionary helpers --------------------
 def get_dict_struct():
-    # Write embedded CSV to a temp file, then reuse ark.load_service_blocks
+    """Parse embedded DICT_CSV into service blocks, stage orders, and piece types."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", encoding="utf-8") as tdf:
         tdf.write(DICT_CSV)
         dict_path = tdf.name
     service_blocks, service_stage_orders = ark.load_service_blocks(dict_path)
-    # Piece types from all blocks
     piece_types = set()
     for sb in service_blocks.values():
         piece_types.update([x for x in sb["Piece Type"].tolist() if isinstance(x, str)])
@@ -50,43 +50,49 @@ def get_conn():
     return conn
 
 def init_db():
+    """Create tables if they don't exist and seed the admin user."""
     conn = get_conn()
     cur = conn.cursor()
     # Employees
-    cur.execute("""    CREATE TABLE IF NOT EXISTS employees(
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS employees(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE NOT NULL,
         can_prep INTEGER NOT NULL DEFAULT 1,
         can_finish INTEGER NOT NULL DEFAULT 0
     );
-    """ )
-    # Shifts
-    cur.execute("""    CREATE TABLE IF NOT EXISTS employee_shifts(
+    """)
+    # Employee shifts
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS employee_shifts(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
         weekday INTEGER NOT NULL,
         start TEXT NOT NULL,
         end   TEXT NOT NULL
     );
-    """ )
-    # Days off
-    cur.execute("""    CREATE TABLE IF NOT EXISTS employee_days_off(
+    """)
+    # Employee days off
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS employee_days_off(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
         off_date TEXT NOT NULL
     );
-    """ )
+    """)
     # Special projects
-    cur.execute("""    CREATE TABLE IF NOT EXISTS special_projects(
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS special_projects(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
         label TEXT NOT NULL,
         start_ts TEXT NOT NULL,
         end_ts   TEXT NOT NULL
     );
-    """ )
+    """)
     # Jobs
-    cur.execute("""    CREATE TABLE IF NOT EXISTS jobs(
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS jobs(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         customer TEXT NOT NULL,
         job TEXT NOT NULL,
@@ -94,23 +100,26 @@ def init_db():
         stage_completed TEXT NOT NULL,
         qty INTEGER NOT NULL DEFAULT 1
     );
-    """ )
+    """)
     # Priorities
-    cur.execute("""    CREATE TABLE IF NOT EXISTS priorities_customers(
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS priorities_customers(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         customer TEXT UNIQUE NOT NULL,
         weight REAL NOT NULL DEFAULT 1.0
     );
-    """ )
-    cur.execute("""    CREATE TABLE IF NOT EXISTS priorities_targets(
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS priorities_targets(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         customer TEXT NOT NULL,
         stage TEXT NOT NULL,
         by_date TEXT NOT NULL
     );
-    """ )
+    """)
     # Global settings
-    cur.execute("""    CREATE TABLE IF NOT EXISTS global_settings(
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS global_settings(
         id INTEGER PRIMARY KEY CHECK(id=1),
         window_start TEXT NOT NULL,
         window_end   TEXT NOT NULL,
@@ -118,15 +127,16 @@ def init_db():
         gap_before_assembly_hours REAL NOT NULL DEFAULT 12,
         assembly_earliest_hour INTEGER NOT NULL DEFAULT 9
     );
-    """ )
-    cur.execute("SELECT COUNT(*) FROM global_settings")
+    """)
+    cur.execute("SELECT COUNT(*) FROM global_settings;")
     if cur.fetchone()[0] == 0:
-        cur.execute("""            INSERT INTO global_settings
+        cur.execute("""INSERT INTO global_settings
             (id, window_start, window_end, gap_after_finish_hours, gap_before_assembly_hours, assembly_earliest_hour)
             VALUES (1, '2025-11-12 08:00', '2025-11-23 23:59', 2, 12, 9)
-        """ )
-    # Users
-    cur.execute("""    CREATE TABLE IF NOT EXISTS users(
+        """)
+    # Users (auth)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         email TEXT UNIQUE NOT NULL,
@@ -135,30 +145,34 @@ def init_db():
         employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
         active INTEGER NOT NULL DEFAULT 1
     );
-    """ )
-    # Pre-seed admin if missing
-    cur.execute("SELECT id FROM users WHERE email=?", ('info@arkfurniture.ca',))
-    if cur.fetchone() is None:
+    """)
+    # Pre-seed requested admin if not present
+    cur.execute("SELECT id FROM users WHERE lower(email)=lower(?)", ('info@arkfurniture.ca',))
+    row = cur.fetchone()
+    if row is None:
         pwh = hash_password("password")
-        cur.execute(
-            """            INSERT INTO users(name,email,role,password_hash,employee_id,active)
-            VALUES (?,?,?,?,?,1)
-            """ ,
-            ("Kyle Babineau","info@arkfurniture.ca","admin",pwh,None)
-        )
+        cur.execute("""INSERT INTO users(name,email,role,password_hash,employee_id,active)
+                       VALUES (?,?,?,?,?,1)""",
+                    ("Kyle Babineau","info@arkfurniture.ca","admin",pwh,None))
+    # Optional: admin reset via env var
+    reset_pw = os.environ.get("ARK_ADMIN_RESET_PASSWORD")
+    if reset_pw:
+        pwh2 = hash_password(reset_pw)
+        cur.execute("UPDATE users SET password_hash=? WHERE lower(email)=lower(?)", (pwh2, "info@arkfurniture.ca"))
     conn.commit()
     conn.close()
 
-# Initialize on import
-init_db()
-
 def fetch_df(query, params=()):
+    """Run a SELECT and return a pandas DataFrame."""
     conn = get_conn()
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
+    try:
+        df = pd.read_sql_query(query, conn, params=params)
+    finally:
+        conn.close()
     return df
 
 def execute(query, params=()):
+    """Run a mutating SQL (INSERT/UPDATE/DELETE)."""
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(query, params)
@@ -166,11 +180,12 @@ def execute(query, params=()):
     conn.close()
 
 def users_exist() -> bool:
-    # Return True if at least one user exists; initialize DB if needed
+    """Return True if at least one user exists; False if table missing or empty."""
     try:
         df = fetch_df("SELECT COUNT(*) as n FROM users")
         return int(df["n"].iloc[0]) > 0
     except Exception:
+        # Table may not exist yet; initialize and re-check
         try:
             init_db()
             df = fetch_df("SELECT COUNT(*) as n FROM users")
@@ -180,7 +195,7 @@ def users_exist() -> bool:
 
 # -------------------- Session auth helpers --------------------
 if "auth_user" not in st.session_state:
-    st.session_state["auth_user"] = None  # dict: id,name,email,role,employee_id
+    st.session_state["auth_user"] = None  # dict with keys id,name,email,role,employee_id
 
 def login_view():
     st.title("ARK Production Scheduler")
@@ -195,12 +210,15 @@ def login_view():
             row = cur.fetchone()
             conn.close()
             if not row:
-                st.error("Invalid email or password."); return
+                st.error("Invalid email or password.")
+                return
             uid, name, email2, role, pwh, emp_id, active = row
             if not active:
-                st.error("Account is inactive. Contact admin."); return
+                st.error("Account is inactive. Contact admin.")
+                return
             if not verify_password(pw, pwh):
-                st.error("Invalid email or password."); return
+                st.error("Invalid email or password.")
+                return
             st.session_state["auth_user"] = {"id": uid, "name": name, "email": email2, "role": role, "employee_id": emp_id}
             st.success(f"Welcome, {name} ({role})")
             st.experimental_rerun()
@@ -209,9 +227,10 @@ def login_view():
 
 def top_bar():
     au = st.session_state["auth_user"]
-    if not au: return
+    if not au: 
+        return
     st.sidebar.markdown(f"**Signed in as:** {au['name']}  \n**Role:** {au['role']}")
-    # Self-serve change password (form)
+    # Self-serve change password
     with st.sidebar.expander("Change password"):
         with st.form("change_pw_form", clear_on_submit=True):
             cur_pw = st.text_input("Current password", type="password", key="cp_cur")
@@ -221,7 +240,7 @@ def top_bar():
         if submitted_cp:
             if not new_pw or new_pw != new_pw2:
                 st.warning("New passwords do not match.")
-            elif len(new_pw) < 8:
+            elif len(new_pw.strip()) < 8:
                 st.warning("Please choose a password with at least 8 characters.")
             else:
                 try:
@@ -231,7 +250,7 @@ def top_bar():
                     if not row or not verify_password(cur_pw or "", row[0]):
                         st.error("Current password is incorrect.")
                     else:
-                        pwh = hash_password(new_pw)
+                        pwh = hash_password(new_pw.strip())
                         cur.execute("UPDATE users SET password_hash=? WHERE id=?", (pwh, au["id"]))
                         conn.commit(); conn.close()
                         st.success("Password updated. Please sign in again.")
@@ -292,10 +311,9 @@ def admin_app():
                         st.error(f"Could not add shift: {e}")
 
         st.markdown("**Shifts**")
-        sh = fetch_df("""            SELECT e.name, s.weekday, s.start, s.end, s.id
-            FROM employee_shifts s JOIN employees e ON e.id=s.employee_id
-            ORDER BY e.name, s.weekday
-        """ )
+        sh = fetch_df("""SELECT e.name, s.weekday, s.start, s.end, s.id
+                         FROM employee_shifts s JOIN employees e ON e.id=s.employee_id
+                         ORDER BY e.name, s.weekday""")
         if not sh.empty:
             sh["weekday"] = sh["weekday"].map({0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"})
         st.dataframe(sh)
@@ -332,7 +350,7 @@ def admin_app():
         st.subheader("Jobs")
         svc = st.selectbox("Service", SERVICES, index=0, key="job_service")
         stage_options = ["Not Started"] + SERVICE_STAGE_ORDERS[svc]
-        piece = st.selectbox("Job Type (Piece)", PIECE_TYPES, index=(PIECE_TYPES.index("Dining Table") if "Dining Table" in PIECE_TYPES else 0))
+        piece = st.selectbox("Job Type (Piece)", PIECE_TYPES, index=PIECE_TYPES.index("Dining Table") if "Dining Table" in PIECE_TYPES else 0)
         c1,c2,c3 = st.columns(3)
         customer = c1.text_input("Customer")
         stage_completed = c2.selectbox("Stage completed", stage_options, index=0, key="job_stage")
@@ -389,10 +407,9 @@ def admin_app():
                         st.success("Special project added")
                     except Exception as e:
                         st.error(f"Could not add block: {e}")
-        sp_df = fetch_df("""            SELECT sp.id, e.name as employee, sp.label, sp.start_ts, sp.end_ts
-            FROM special_projects sp JOIN employees e ON e.id=sp.employee_id
-            ORDER BY sp.start_ts
-        """ )
+        sp_df = fetch_df("""SELECT sp.id, e.name as employee, sp.label, sp.start_ts, sp.end_ts
+                            FROM special_projects sp JOIN employees e ON e.id=sp.employee_id
+                            ORDER BY sp.start_ts""")
         st.dataframe(sp_df)
 
     # Time Off
@@ -414,10 +431,9 @@ def admin_app():
                         st.success("Day off added")
                     except Exception as e:
                         st.error(f"Could not add day off: {e}")
-        off_df = fetch_df("""            SELECT d.id, e.name as employee, d.off_date
-            FROM employee_days_off d JOIN employees e ON e.id=d.employee_id
-            ORDER BY d.off_date, e.name
-        """ )
+        off_df = fetch_df("""SELECT d.id, e.name as employee, d.off_date
+                              FROM employee_days_off d JOIN employees e ON e.id=d.employee_id
+                              ORDER BY d.off_date, e.name""")
         st.dataframe(off_df)
 
     # Priorities & Rules
@@ -445,7 +461,7 @@ def admin_app():
         with st.form("add_target"):
             c1,c2,c3 = st.columns(3)
             cust2 = c1.selectbox("Customer", cust_list) if cust_list else c1.text_input("Customer")
-            stage = c2.selectbox("Stage", stage_list, index=(stage_list.index("Assembly") if "Assembly" in stage_list else 0))
+            stage = c2.selectbox("Stage", stage_list, index=stage_list.index("Assembly") if "Assembly" in stage_list else 0)
             by_dt = c3.date_input("By date", value=date(2025,11,14))
             ok2 = st.form_submit_button("Add target")
             if ok2 and ((cust_list and cust2) or (not cust_list and str(cust2).strip())):
@@ -469,9 +485,8 @@ def admin_app():
                 ae = c5.number_input("Assembly earliest hour (0–23)", value=int(gs_row["assembly_earliest_hour"]), min_value=0, max_value=23, step=1)
                 ok3 = st.form_submit_button("Save window & rules")
                 if ok3:
-                    execute("""                        UPDATE global_settings SET window_start=?, window_end=?, gap_after_finish_hours=?, gap_before_assembly_hours=?, assembly_earliest_hour=?
-                        WHERE id=1
-                    """ , (ws, we, float(gap2), float(gap12), int(ae)))
+                    execute("""UPDATE global_settings SET window_start=?, window_end=?, gap_after_finish_hours=?, gap_before_assembly_hours=?, assembly_earliest_hour=? WHERE id=1""",
+                            (ws, we, float(gap2), float(gap12), int(ae)))
                     st.success("Saved.")
 
     # Run Scheduler
@@ -491,7 +506,7 @@ def employee_app():
     au = st.session_state["auth_user"]
     st.title("ARK — Employee Portal")
 
-    emp = fetch_df("SELECT id, name FROM employees WHERE id=?", (au.get("employee_id"),)) if au.get("employee_id") else pd.DataFrame()
+    emp = fetch_df("SELECT id, name FROM employees WHERE id=?", (au["employee_id"],)) if au.get("employee_id") else pd.DataFrame()
     emp_name = emp.iloc[0]["name"] if not emp.empty else None
     if not emp_name:
         st.warning("Your account is not linked to an employee record yet. Ask an admin to link it in User Management.")
@@ -501,7 +516,7 @@ def employee_app():
     with tabs[0]:
         if emp_name:
             st.subheader(f"Availability for {emp_name}")
-            shifts = fetch_df("SELECT weekday, start, end FROM employee_shifts WHERE employee_id=? ORDER BY weekday", (au["employee_id"],))
+            shifts = fetch_df("""SELECT weekday, start, end FROM employee_shifts WHERE employee_id=? ORDER BY weekday""", (au["employee_id"],))
             if not shifts.empty:
                 shifts["weekday"] = shifts["weekday"].map({0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"})
             st.markdown("**Shifts**")
@@ -545,6 +560,7 @@ def employee_app():
 # -------------------- Shared scheduling helpers --------------------
 @st.cache_data(show_spinner=False, ttl=60)
 def run_scheduler_cached():
+    """Build the current schedule from DB state (cached briefly)."""
     try:
         gs = fetch_df("SELECT * FROM global_settings WHERE id=1")
         if gs.empty:
@@ -573,7 +589,7 @@ def run_scheduler_cached():
             if e["can_prep"]: abilities.append("prep")
             if e["can_finish"]: abilities.append("finishing")
             my_shifts = [s for s in shifts if s["employee_id"]==e["id"]]
-            shift_list = [{"days":[int(s["weekday")],"start":str(s["start"]), "end":str(s["end"])} for s in my_shifts]
+            shift_list = [{"days":[int(s["weekday"])],"start":str(s["start"]), "end":str(s["end"])} for s in my_shifts]
             my_offs = [o for o in offs if o["employee_id"]==e["id"]]
             days_off = [str(o["off_date"]) for o in my_offs]
             cfg["employees"].append({
@@ -612,9 +628,10 @@ def run_scheduler_cached():
         return None
 
 def run_and_display_schedule():
+    """Run scheduler now and render master + per-employee schedules."""
     df = run_scheduler_cached()
     if df is None or df.empty:
-        st.info("No schedule generated (check jobs/employees/shifts/rules)." )
+        st.info("No schedule generated (check jobs/employees/shifts/rules).")
         return
     st.markdown("### Master Schedule")
     st.dataframe(df.head(500))
@@ -661,29 +678,24 @@ def user_management_view():
                     if link_emp != "(none)":
                         emp_id = int(emp_list.loc[emp_list["name"]==link_emp, "id"].values[0])
                     conn = get_conn(); cur = conn.cursor()
-                    cur.execute(
-                        """                        INSERT INTO users(name,email,role,password_hash,employee_id,active)
-                        VALUES (?,?,?,?,?,1)
-                        """ ,
-                        (name.strip(), email.strip().lower(), role, pwh, emp_id)
-                    )
+                    cur.execute("""INSERT INTO users(name,email,role,password_hash,employee_id,active)
+                                   VALUES (?,?,?,?,?,1)""", (name.strip(), email.strip().lower(), role, pwh, emp_id))
                     conn.commit(); conn.close()
                     st.success(f"Created {role} account for {name}.")
                 except Exception as e:
                     st.error(f"Could not create user: {e}")
 
     # Users table
-    users = fetch_df("""        SELECT u.id, u.name, u.email, u.role, u.active, e.name as employee
-        FROM users u LEFT JOIN employees e ON e.id=u.employee_id
-        ORDER BY u.role, u.name
-    """ )
+    users = fetch_df("""SELECT u.id, u.name, u.email, u.role, u.active, e.name as employee
+                        FROM users u LEFT JOIN employees e ON e.id=u.employee_id
+                        ORDER BY u.role, u.name""")
     st.dataframe(users)
 
     # Reset password / deactivate / relink
     if not users.empty:
         with st.form("manage_user"):
             uid = st.selectbox("User", users["id"].tolist())
-            action = st.selectbox("Action", ["Reset password","Deactivate","Activate","Link to employee","Unlink employee"])            
+            action = st.selectbox("Action", ["Reset password","Deactivate","Activate","Link to employee","Unlink employee"])
             emp_list = fetch_df("SELECT id, name FROM employees ORDER BY name")
             link_to = st.selectbox("Employee to link", ["(none)"] + emp_list["name"].tolist())
             new_pw = st.text_input("New password (for reset)", type="password")
@@ -692,8 +704,8 @@ def user_management_view():
                 try:
                     conn = get_conn(); cur = conn.cursor()
                     if action == "Reset password":
-                        if not new_pw.strip() or len(new_pw.strip()) < 8:
-                            st.warning("Enter a new password (min 8 chars)." ); conn.close()
+                        if not new_pw.strip():
+                            st.warning("Enter a new password."); conn.close()
                         else:
                             pwh = hash_password(new_pw.strip())
                             cur.execute("UPDATE users SET password_hash=? WHERE id=?", (pwh, int(uid)))
@@ -719,13 +731,11 @@ def user_management_view():
 
 # -------------------- Main entry --------------------
 def main():
-    # Ensure DB & at least one user record exist (init_db will seed the admin if needed)
-    try:
-        if not users_exist():
-            init_db()
-    except Exception:
+    # Ensure DB is initialized and seed admin
+    init_db()
+    # Optional: if still empty for some reason, try again (no-op if exists)
+    if not users_exist():
         init_db()
-
     au = st.session_state["auth_user"]
     if not au:
         login_view()
