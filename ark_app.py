@@ -366,14 +366,16 @@ def admin_app():
         if not emp_df.empty:
             with st.form("del_employee"):
                 st.markdown("**Delete an employee** (cascades to shifts/days-off/projects)")
-                del_name = st.selectbox("Employee", emp_df["name"].tolist())
+                emp_df["_label"] = emp_df.apply(lambda r: f"{r['id']} – {r['name']}", axis=1)
+                sel_emp = st.selectbox("Employee", emp_df["_label"].tolist(), key="emp_delete_select")
                 confirm = st.checkbox("Type DELETE below and check this", value=False, key="emp_del_chk")
-                text_confirm = st.text_input("Type: DELETE to confirm", "")
+                text_confirm = st.text_input("Type: DELETE to confirm", "", key="emp_del_text")
                 if st.form_submit_button("Delete employee"):
                     if confirm and text_confirm.strip().upper() == "DELETE":
                         try:
-                            execute("DELETE FROM employees WHERE name=?", (del_name,))
-                            st.success(f"Deleted employee: {del_name}")
+                            emp_id = int(sel_emp.split(" – ")[0])
+                            execute("DELETE FROM employees WHERE id=?", (emp_id,))
+                            st.success(f"Deleted employee id {emp_id}")
                         except Exception as e:
                             st.error(f"Could not delete employee: {e}")
                     else:
@@ -399,16 +401,16 @@ def admin_app():
                     st.error(f"Could not add job: {e}")
             else:
                 st.warning("Customer is required.")
-        jobs_df = fetch_df("SELECT * FROM jobs ORDER BY customer, job, service")
+        jobs_df = fetch_df("SELECT * FROM jobs ORDER BY id ASC")
         st.dataframe(jobs_df)
         if not jobs_df.empty:
             with st.form("del_job"):
                 st.markdown("**Delete a job**")
-                jobs_df["label"] = jobs_df.apply(lambda r: f"{r['id']} – {r['customer']} | {r['qty']} x {r['job']} | {r['service']}", axis=1)
-                selection = st.selectbox("Job", jobs_df["label"].tolist())
+                jobs_df["_label"] = jobs_df.apply(lambda r: f"{r['id']} – {r['customer']} | {r['qty']} x {r['job']} | {r['service']}", axis=1)
+                selection = st.selectbox("Job", jobs_df["_label"].tolist(), key="job_delete_select")
                 if st.form_submit_button("Delete job"):
-                    jid = int(selection.split(" – ")[0])
                     try:
+                        jid = int(str(selection).split(" – ")[0])
                         execute("DELETE FROM jobs WHERE id=?", (jid,))
                         st.success(f"Deleted job id {jid}")
                     except Exception as e:
@@ -445,6 +447,22 @@ def admin_app():
                             FROM special_projects sp JOIN employees e ON e.id=sp.employee_id
                             ORDER BY sp.start_ts""")
         st.dataframe(sp_df)
+        if not sp_df.empty:
+            with st.form("del_sp"):
+                st.markdown("**Delete a special project block**")
+                sp_df["_label"] = sp_df.apply(lambda r: f"{r['id']} – {r['employee']} | {r['label']} | {r['start_ts']} → {r['end_ts']}", axis=1)
+                sel_sp = st.selectbox("Special project", sp_df["_label"].tolist(), key="sp_delete_select")
+                confirm_sp = st.checkbox("Confirm delete", value=False, key="sp_del_chk")
+                if st.form_submit_button("Delete block"):
+                    if confirm_sp:
+                        try:
+                            sp_id = int(str(sel_sp).split(" – ")[0])
+                            execute("DELETE FROM special_projects WHERE id=?", (sp_id,))
+                            st.success(f"Deleted special project id {sp_id}")
+                        except Exception as e:
+                            st.error(f"Could not delete special project: {e}")
+                    else:
+                        st.warning("Please confirm deletion.")
 
     # Time Off
     with tabs[3]:
@@ -576,7 +594,7 @@ def employee_app():
     # Active Jobs (read-only)
     with tabs[2]:
         st.subheader("Active Jobs")
-        jobs = fetch_df("SELECT customer, job, service, stage_completed, qty FROM jobs ORDER BY customer, job")
+        jobs = fetch_df("SELECT customer, job, service, stage_completed, qty FROM jobs ORDER BY id ASC")
         st.dataframe(jobs)
 
     # Master Schedule
@@ -642,7 +660,7 @@ def run_scheduler_cached():
             tdf.write(DICT_CSV)
             dict_path = tdf.name
 
-        jobs = fetch_df("SELECT customer, job, service, stage_completed, qty FROM jobs ORDER BY customer, job")
+        jobs = fetch_df("SELECT customer, job, service, stage_completed, qty FROM jobs ORDER BY id ASC")
         if jobs.empty:
             return pd.DataFrame()
         jobs["Job"] = jobs.apply(lambda r: (f"{int(r['qty'])} {r['job']}" if int(r["qty"])>1 else r["job"]), axis=1)
