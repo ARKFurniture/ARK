@@ -1,28 +1,73 @@
 
 import streamlit as st
 import pandas as pd
-import json, os, sqlite3, tempfile, hashlib, binascii, base64
+import json, os, sqlite3, tempfile, hashlib, binascii
 from datetime import date
 import ark_scheduler as ark
 from ark_dictionary import DICT_CSV
 
-st.set_page_config(page_title="ARK Production Scheduler", layout="wide")
-# ---- Simple UI wrappers (no recursion) ----
-def H1(s: str):
-    import streamlit as st
-    st.header(s)
+st.set_page_config(page_title="ARK Production Scheduler", layout="wide", page_icon="🪑")
 
-def H2(s: str):
-    import streamlit as st
-    st.subheader(s)
+from pathlib import Path
 
-def MD(s: str):
-    import streamlit as st
-    st.markdown(s)
+def _apply_branding():
+    css_path = Path("styles.css")
+    try:
+        css = css_path.read_text(encoding="utf-8")
+    except Exception:
+        css = ""
+    st.markdown(f"""<style>{css}</style>""", unsafe_allow_html=True)
+    # Header band with logo on every page load
+    try:
+        logo_svg = Path("ark_logo.svg").read_text(encoding="utf-8")
+        st.markdown(f'<div class="brand-header"><div>{logo_svg}</div><div><p class="brand-header__title">ARK Production Scheduler</p><p class="brand-header__subtitle">Fast, clean, and on-brand scheduling</p></div></div>', unsafe_allow_html=True)
+    except Exception:
+        st.markdown('<div class="brand-header"><p class="brand-header__title">ARK Production Scheduler</p><p class="brand-header__subtitle">Fast, clean, and on-brand scheduling</p></div>', unsafe_allow_html=True)
 
-def CAP(s: str):
-    import streamlit as st
-    st.caption(s)
+_apply_branding()
+
+# -------------------- Legacy-safe rendering for older Safari/WebKit --------------------
+# Enable by adding ?safe=1 to the app URL or setting env ARK_SAFE_MARKDOWN=1
+USE_SAFE = False
+try:
+    # Streamlit >=1.29 has st.query_params dict-like interface
+    qp = getattr(st, "query_params", {}) or {}
+    if isinstance(qp, dict):
+        val = qp.get("safe", None)
+        if isinstance(val, list):
+            val = val[0] if val else None
+        if str(val).lower() in ("1","true","yes"):
+            USE_SAFE = True
+except Exception:
+    pass
+
+import os as _os, re as _re
+if _os.getenv("ARK_SAFE_MARKDOWN") in ("1","true","yes"):
+    USE_SAFE = True
+
+if USE_SAFE:
+    def _strip_md(s):
+        return _re.sub(r"[`*_>#]", "", str(s))
+    # Keep original refs if needed later
+    _orig_title = st.title
+    _orig_header = st.header
+    _orig_subheader = st.subheader
+    _orig_caption = st.caption
+    _orig_markdown = st.markdown
+    _orig_info = st.info
+    _orig_warning = st.warning
+    _orig_success = st.success
+    _orig_error = st.error
+
+    st.title = lambda s: st.text(_strip_md(s))
+    st.header = lambda s: st.text(_strip_md(s))
+    st.subheader = lambda s: st.text(_strip_md(s))
+    st.caption = lambda s: st.text(_strip_md(s))
+    st.markdown = lambda s, **kwargs: st.text(_strip_md(s))
+    st.info = lambda s: st.text(_strip_md(s))
+    st.warning = lambda s: st.text(_strip_md(s))
+    st.success = lambda s: st.text(_strip_md(s))
+    st.error = lambda s: st.text(_strip_md(s))
 
 
 # -------------------- Auth utilities --------------------
@@ -73,9 +118,8 @@ def init_db():
         name TEXT UNIQUE NOT NULL,
         can_prep INTEGER NOT NULL DEFAULT 1,
         can_finish INTEGER NOT NULL DEFAULT 0
-    );
-    """)
-    # Shifts
+    );""")
+    # Employee shifts
     cur.execute("""
     CREATE TABLE IF NOT EXISTS employee_shifts(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,16 +127,14 @@ def init_db():
         weekday INTEGER NOT NULL,
         start TEXT NOT NULL,
         end   TEXT NOT NULL
-    );
-    """)
-    # Days off
+    );""")
+    # Employee days off
     cur.execute("""
     CREATE TABLE IF NOT EXISTS employee_days_off(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
         off_date TEXT NOT NULL
-    );
-    """)
+    );""")
     # Special projects
     cur.execute("""
     CREATE TABLE IF NOT EXISTS special_projects(
@@ -101,8 +143,7 @@ def init_db():
         label TEXT NOT NULL,
         start_ts TEXT NOT NULL,
         end_ts   TEXT NOT NULL
-    );
-    """)
+    );""")
     # Jobs
     cur.execute("""
     CREATE TABLE IF NOT EXISTS jobs(
@@ -112,24 +153,21 @@ def init_db():
         service TEXT NOT NULL,
         stage_completed TEXT NOT NULL,
         qty INTEGER NOT NULL DEFAULT 1
-    );
-    """)
+    );""")
     # Priorities
     cur.execute("""
     CREATE TABLE IF NOT EXISTS priorities_customers(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         customer TEXT UNIQUE NOT NULL,
         weight REAL NOT NULL DEFAULT 1.0
-    );
-    """)
+    );""")
     cur.execute("""
     CREATE TABLE IF NOT EXISTS priorities_targets(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         customer TEXT NOT NULL,
         stage TEXT NOT NULL,
         by_date TEXT NOT NULL
-    );
-    """)
+    );""")
     # Global settings
     cur.execute("""
     CREATE TABLE IF NOT EXISTS global_settings(
@@ -139,15 +177,12 @@ def init_db():
         gap_after_finish_hours REAL NOT NULL DEFAULT 2,
         gap_before_assembly_hours REAL NOT NULL DEFAULT 12,
         assembly_earliest_hour INTEGER NOT NULL DEFAULT 9
-    );
-    """)
-    cur.execute("SELECT COUNT(*) FROM global_settings")
+    );""")
+    cur.execute("SELECT COUNT(*) FROM global_settings;")
     if cur.fetchone()[0] == 0:
-        cur.execute("""
-            INSERT INTO global_settings
+        cur.execute("""INSERT INTO global_settings
             (id, window_start, window_end, gap_after_finish_hours, gap_before_assembly_hours, assembly_earliest_hour)
-            VALUES (1, '2025-11-12 08:00', '2025-11-23 23:59', 2, 12, 9)
-        """)
+            VALUES (1, '2025-11-12 08:00', '2025-11-23 23:59', 2, 12, 9)""")
     # Users
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users(
@@ -158,41 +193,17 @@ def init_db():
         password_hash TEXT NOT NULL,
         employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
         active INTEGER NOT NULL DEFAULT 1
-    );
-    """)
-    # Branding
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS branding(
-        id INTEGER PRIMARY KEY CHECK(id=1),
-        primary_color TEXT NOT NULL DEFAULT '#1f6feb',
-        accent_color TEXT NOT NULL DEFAULT '#22c55e',
-        text_color TEXT NOT NULL DEFAULT '#0b132b',
-        bg_color TEXT NOT NULL DEFAULT '#ffffff',
-        secondary_bg_color TEXT NOT NULL DEFAULT '#f6f8fa',
-        font_family TEXT NOT NULL DEFAULT 'Inter',
-        font_url TEXT NOT NULL DEFAULT 'https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap',
-        logo BLOB
-    );
-    """)
-    cur.execute("SELECT COUNT(*) FROM branding")
-    if cur.fetchone()[0] == 0:
-        cur.execute("""
-            INSERT INTO branding(id,primary_color,accent_color,text_color,bg_color,secondary_bg_color,font_family,font_url,logo)
-            VALUES (1,'#1f6feb','#22c55e','#0b132b','#ffffff','#f6f8fa','Inter',
-            'https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap', NULL)
-        """)
-    # Seed admin if missing
-    cur.execute("SELECT id FROM users WHERE email=?", ('info@arkfurniture.ca',))
-    if cur.fetchone() is None:
+    );""")
+    # Pre-seed requested admin if not present
+    cur.execute("SELECT id FROM users WHERE lower(email)=lower(?)", ('info@arkfurniture.ca',))
+    row = cur.fetchone()
+    if row is None:
         pwh = hash_password("password")
-        cur.execute("""
-            INSERT INTO users(name,email,role,password_hash,employee_id,active)
-            VALUES (?,?,?,?,?,1)
-        """, ("Kyle Babineau","info@arkfurniture.ca","admin",pwh,None))
+        cur.execute("""INSERT INTO users(name,email,role,password_hash,employee_id,active)
+                       VALUES (?,?,?,?,?,1)""",
+                    ("Kyle Babineau","info@arkfurniture.ca","admin",pwh,None))
     conn.commit()
     conn.close()
-
-init_db()
 
 def fetch_df(query, params=()):
     conn = get_conn()
@@ -208,126 +219,22 @@ def execute(query, params=()):
     conn.close()
 
 def users_exist() -> bool:
-    try:
-        df = fetch_df("SELECT COUNT(*) as n FROM users")
-        return int(df["n"].iloc[0]) > 0
-    except Exception:
-        try:
-            init_db()
-            df = fetch_df("SELECT COUNT(*) as n FROM users")
-            return int(df["n"].iloc[0]) > 0
-        except Exception:
-            return False
-
-# -------------------- Branding helpers --------------------
-def get_branding():
-    df = fetch_df("SELECT * FROM branding WHERE id=1")
-    if df.empty:
-        return {
-            "primary_color":"#1f6feb","accent_color":"#22c55e","text_color":"#0b132b",
-            "bg_color":"#ffffff","secondary_bg_color":"#f6f8fa",
-            "font_family":"Inter",
-            "font_url":"https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap",
-            "logo": None
-        }
-    row = df.iloc[0].to_dict()
-    return row
-
-def apply_branding():
-    brand = get_branding()
-    # Inject font
-    st.markdown(f"<link rel='stylesheet' href='{brand['font_url']}'>", unsafe_allow_html=True)
-    # Logo
-    logo_b64 = None
+    """Return True if at least one user exists."""
     try:
         conn = get_conn(); cur = conn.cursor()
-        cur.execute("SELECT logo FROM branding WHERE id=1")
-        r = cur.fetchone()
-        conn.close()
-        if r and r[0] is not None:
-            logo_b64 = base64.b64encode(r[0]).decode()
+        cur.execute("SELECT COUNT(*) FROM users")
+        row = cur.fetchone(); conn.close()
+        return bool(row and row[0] > 0)
     except Exception:
-        logo_b64 = None
-
-    # Inject CSS
-    css = f"""
-    <style>
-    :root{{
-      --ark-primary: {brand['primary_color']};
-      --ark-accent: {brand['accent_color']};
-      --ark-text: {brand['text_color']};
-      --ark-bg: {brand['bg_color']};
-      --ark-bg2: {brand['secondary_bg_color']};
-      --ark-font: '{brand['font_family']}', -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
-    }}
-    html, body, [data-testid="stAppViewContainer"] {{
-      font-family: var(--ark-font) !important;
-      color: var(--ark-text);
-      background: var(--ark-bg);
-    }}
-    [data-testid="stHeader"] {{ background: linear-gradient(90deg, var(--ark-bg), var(--ark-bg2)); }}
-    .ark-hero {{
-      background: linear-gradient(135deg, var(--ark-primary) 0%, var(--ark-accent) 100%);
-      color: white;
-      padding: 18px 22px;
-      border-radius: 12px;
-      margin: 8px 0 18px 0;
-      display: flex; align-items: center; gap: 14px;
-      box-shadow: 0 8px 24px rgba(16,24,40,0.12);
-    }}
-    .ark-hero .ark-logo {{
-      width: 44px; height: 44px; border-radius: 8px;
-      background: rgba(255,255,255,0.2);
-      display:flex; align-items:center; justify-content:center;
-      font-weight:700;
-    }}
-    .ark-hero h1 {{
-      font-size: 1.3rem; line-height: 1.2; margin: 0 0 4px 0;
-    }}
-    .ark-hero p {{ margin: 0; opacity: 0.95; }}
-    .stTabs [data-baseweb="tab-list"] button {{ gap: 8px; }}
-    .stTabs [aria-selected="true"] {{ border-bottom: 3px solid var(--ark-primary); }}
-    div.stButton > button {{
-      background: var(--ark-primary); color: #fff;
-      border-radius: 8px; border: none;
-    }}
-    div.stDownloadButton > button {{
-      background: var(--ark-accent); color: #0b132b;
-      border-radius: 8px; border: none;
-    }}
-    .ark-card {{
-      border-radius: 12px; padding: 14px; background: var(--ark-bg2);
-      border: 1px solid rgba(0,0,0,0.06);
-    }}
-    .small-muted {{ opacity: 0.75; font-size: 0.85rem; }}
-    </style>
-    """
-    st.markdown(css, unsafe_allow_html=True)
-
-    return logo_b64
-
-def hero(title: str, subtitle: str = ""):
-    logo_b64 = apply_branding()
-    if logo_b64:
-        logo_html = f"<img src='data:image/png;base64,{logo_b64}' style='width:44px;height:44px;border-radius:8px;object-fit:cover'/>"
-    else:
-        logo_html = "<div class='ark-logo'>ARK</div>"
-    st.markdown(f"""
-    <div class='ark-hero'>
-      {logo_html}
-      <div>
-        <h1>{title}</h1>
-        <p>{subtitle}</p>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+        return False
 
 # -------------------- Session auth helpers --------------------
 if "auth_user" not in st.session_state:
-    st.session_state["auth_user"] = None
+    st.session_state["auth_user"] = None  # dict with keys id,name,email,role,employee_id
 
 def login_view():
-    hero("ARK Production Scheduler", "Sign in to continue")
+    st.title("ARK Production Scheduler")
+    st.subheader("Sign in")
     st.caption("Tip: For older iPhones/iPads, use iOS 16+/Safari 16+ or Chrome if you see a browser regex error.")
     email = st.text_input("Email", "")
     pw = st.text_input("Password", "", type="password")
@@ -338,13 +245,17 @@ def login_view():
             row = cur.fetchone()
             conn.close()
             if not row:
-                st.error("Invalid email or password."); return
+                st.error("Invalid email or password.")
+                return
             uid, name, email2, role, pwh, emp_id, active = row
             if not active:
-                st.error("Account is inactive. Contact admin."); return
+                st.error("Account is inactive. Contact admin.")
+                return
             if not verify_password(pw, pwh):
-                st.error("Invalid email or password."); return
+                st.error("Invalid email or password.")
+                return
             st.session_state["auth_user"] = {"id": uid, "name": name, "email": email2, "role": role, "employee_id": emp_id}
+            st.success(f"Welcome, {name} ({role})")
             st.experimental_rerun()
         except Exception as e:
             st.exception(e)
@@ -353,7 +264,7 @@ def top_bar():
     au = st.session_state["auth_user"]
     if not au: return
     st.sidebar.markdown(f"**Signed in as:** {au['name']}  \n**Role:** {au['role']}")
-    # Self-serve change password (form)
+    # Self-serve change password
     with st.sidebar.expander("Change password"):
         with st.form("change_pw_form", clear_on_submit=True):
             cur_pw = st.text_input("Current password", type="password", key="cp_cur")
@@ -387,12 +298,12 @@ def top_bar():
 
 # -------------------- Admin views --------------------
 def admin_app():
-    hero("ARK — Admin", "Plan, prioritize, and schedule production")
     top_bar()
+    st.title("ARK Production Scheduler — Admin")
 
     tabs = st.tabs([
         "Employees", "Jobs", "Special Projects", "Time Off",
-        "Priorities & Rules", "Run Scheduler", "Branding", "User Management"
+        "Priorities & Rules", "Run Scheduler", "User Management"
     ])
 
     # Employees
@@ -413,7 +324,7 @@ def admin_app():
                     st.error(f"Could not add employee: {e}")
 
         emp_df = fetch_df("SELECT * FROM employees ORDER BY name ASC")
-        st.dataframe(emp_df, use_container_width=True)
+        st.dataframe(emp_df)
 
         st.markdown("### Add Shift")
         if not emp_df.empty:
@@ -434,14 +345,12 @@ def admin_app():
                         st.error(f"Could not add shift: {e}")
 
         st.markdown("**Shifts**")
-        sh = fetch_df("""
-            SELECT e.name, s.weekday, s.start, s.end, s.id
-            FROM employee_shifts s JOIN employees e ON e.id=s.employee_id
-            ORDER BY e.name, s.weekday
-        """)
+        sh = fetch_df("""SELECT e.name, s.weekday, s.start, s.end, s.id
+                         FROM employee_shifts s JOIN employees e ON e.id=s.employee_id
+                         ORDER BY e.name, s.weekday""")
         if not sh.empty:
             sh["weekday"] = sh["weekday"].map({0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"})
-        st.dataframe(sh, use_container_width=True)
+        st.dataframe(sh)
 
         if not sh.empty:
             with st.form("del_shift"):
@@ -475,7 +384,7 @@ def admin_app():
         st.subheader("Jobs")
         svc = st.selectbox("Service", SERVICES, index=0, key="job_service")
         stage_options = ["Not Started"] + SERVICE_STAGE_ORDERS[svc]
-        piece = st.selectbox("Job Type (Piece)", PIECE_TYPES, index=(PIECE_TYPES.index("Dining Table") if "Dining Table" in PIECE_TYPES else 0))
+        piece = st.selectbox("Job Type (Piece)", PIECE_TYPES, index=PIECE_TYPES.index("Dining Table") if "Dining Table" in PIECE_TYPES else 0)
         c1,c2,c3 = st.columns(3)
         customer = c1.text_input("Customer")
         stage_completed = c2.selectbox("Stage completed", stage_options, index=0, key="job_stage")
@@ -491,7 +400,7 @@ def admin_app():
             else:
                 st.warning("Customer is required.")
         jobs_df = fetch_df("SELECT * FROM jobs ORDER BY customer, job, service")
-        st.dataframe(jobs_df, use_container_width=True)
+        st.dataframe(jobs_df)
         if not jobs_df.empty:
             with st.form("del_job"):
                 st.markdown("**Delete a job**")
@@ -532,12 +441,10 @@ def admin_app():
                         st.success("Special project added")
                     except Exception as e:
                         st.error(f"Could not add block: {e}")
-        sp_df = fetch_df("""
-            SELECT sp.id, e.name as employee, sp.label, sp.start_ts, sp.end_ts
-            FROM special_projects sp JOIN employees e ON e.id=sp.employee_id
-            ORDER BY sp.start_ts
-        """)
-        st.dataframe(sp_df, use_container_width=True)
+        sp_df = fetch_df("""SELECT sp.id, e.name as employee, sp.label, sp.start_ts, sp.end_ts
+                            FROM special_projects sp JOIN employees e ON e.id=sp.employee_id
+                            ORDER BY sp.start_ts""")
+        st.dataframe(sp_df)
 
     # Time Off
     with tabs[3]:
@@ -558,12 +465,10 @@ def admin_app():
                         st.success("Day off added")
                     except Exception as e:
                         st.error(f"Could not add day off: {e}")
-        off_df = fetch_df("""
-            SELECT d.id, e.name as employee, d.off_date
-            FROM employee_days_off d JOIN employees e ON e.id=d.employee_id
-            ORDER BY d.off_date, e.name
-        """)
-        st.dataframe(off_df, use_container_width=True)
+        off_df = fetch_df("""SELECT d.id, e.name as employee, d.off_date
+                              FROM employee_days_off d JOIN employees e ON e.id=d.employee_id
+                              ORDER BY d.off_date, e.name""")
+        st.dataframe(off_df)
 
     # Priorities & Rules
     with tabs[4]:
@@ -581,7 +486,7 @@ def admin_app():
                             (val, float(w)))
                 conn.commit(); conn.close()
                 st.success(f"Saved priority for {val}")
-        st.dataframe(fetch_df("SELECT * FROM priorities_customers ORDER BY weight, customer"), use_container_width=True)
+        st.dataframe(fetch_df("SELECT * FROM priorities_customers ORDER BY weight, customer"))
 
         all_stage_names = set(["Assembly"])
         for stages in SERVICE_STAGE_ORDERS.values():
@@ -590,7 +495,7 @@ def admin_app():
         with st.form("add_target"):
             c1,c2,c3 = st.columns(3)
             cust2 = c1.selectbox("Customer", cust_list) if cust_list else c1.text_input("Customer")
-            stage = c2.selectbox("Stage", stage_list, index=(stage_list.index("Assembly") if "Assembly" in stage_list else 0))
+            stage = c2.selectbox("Stage", stage_list, index=stage_list.index("Assembly") if "Assembly" in stage_list else 0)
             by_dt = c3.date_input("By date", value=date(2025,11,14))
             ok2 = st.form_submit_button("Add target")
             if ok2 and ((cust_list and cust2) or (not cust_list and str(cust2).strip())):
@@ -598,7 +503,7 @@ def admin_app():
                 execute("INSERT INTO priorities_targets(customer, stage, by_date) VALUES (?,?,?)",
                         (val2, stage, str(by_dt)))
                 st.success("Target added")
-        st.dataframe(fetch_df("SELECT * FROM priorities_targets ORDER BY by_date, customer"), use_container_width=True)
+        st.dataframe(fetch_df("SELECT * FROM priorities_targets ORDER BY by_date, customer"))
 
         st.markdown("**Global rules & scheduling window**")
         gs = fetch_df("SELECT * FROM global_settings WHERE id=1")
@@ -614,10 +519,8 @@ def admin_app():
                 ae = c5.number_input("Assembly earliest hour (0–23)", value=int(gs_row["assembly_earliest_hour"]), min_value=0, max_value=23, step=1)
                 ok3 = st.form_submit_button("Save window & rules")
                 if ok3:
-                    execute("""
-                        UPDATE global_settings SET window_start=?, window_end=?, gap_after_finish_hours=?, gap_before_assembly_hours=?, assembly_earliest_hour=?
-                        WHERE id=1
-                    """, (ws, we, float(gap2), float(gap12), int(ae)))
+                    execute("""UPDATE global_settings SET window_start=?, window_end=?, gap_after_finish_hours=?, gap_before_assembly_hours=?, assembly_earliest_hour=? WHERE id=1""",
+                            (ws, we, float(gap2), float(gap12), int(ae)))
                     st.success("Saved.")
 
     # Run Scheduler
@@ -626,59 +529,17 @@ def admin_app():
         st.markdown("Uses the **embedded Production Hour Dictionary**; no upload needed.")
         if st.button("Run Scheduler", type="primary"):
             run_and_display_schedule()
-
-    # Branding
-    with tabs[6]:
-        st.subheader("Branding")
-        brand = get_branding()
-        c1, c2, c3 = st.columns(3)
-        primary = c1.color_picker("Primary color", brand["primary_color"])
-        accent = c2.color_picker("Accent color", brand["accent_color"])
-        textc = c3.color_picker("Text color", brand["text_color"])
-        c4, c5 = st.columns(2)
-        bg = c4.color_picker("Background", brand["bg_color"])
-        bg2 = c5.color_picker("Panels / Secondary background", brand["secondary_bg_color"])
-        c6, c7 = st.columns(2)
-        font_family = c6.text_input("Font Family", brand["font_family"])
-        font_url = c7.text_input("Google Font URL", brand["font_url"])
-        logo_file = st.file_uploader("Logo (PNG)", type=["png"])
-
-        if st.button("Save Branding"):
-            try:
-                logo_bytes = None
-                if logo_file is not None:
-                    logo_bytes = logo_file.read()
-                conn = get_conn(); cur = conn.cursor()
-                if logo_bytes is None:
-                    cur.execute("""
-                        UPDATE branding SET primary_color=?, accent_color=?, text_color=?, bg_color=?, secondary_bg_color=?, font_family=?, font_url=? WHERE id=1
-                    """, (primary, accent, textc, bg, bg2, font_family, font_url))
-                else:
-                    cur.execute("""
-                        UPDATE branding SET primary_color=?, accent_color=?, text_color=?, bg_color=?, secondary_bg_color=?, font_family=?, font_url=?, logo=? WHERE id=1
-                    """, (primary, accent, textc, bg, bg2, font_family, font_url, logo_bytes))
-                conn.commit(); conn.close()
-                st.success("Branding saved. Refresh to apply everywhere.")
-                apply_branding()
-            except Exception as e:
-                st.error(f"Could not save branding: {e}")
-
-        # Live preview
-        apply_branding()
-        st.markdown("**Preview**")
-        st.markdown("<div class='ark-card'>This is what cards, buttons, and typography will look like.</div>", unsafe_allow_html=True)
-
     # User Management
-    with tabs[7]:
+    with tabs[6]:
         user_management_view()
 
 # -------------------- Employee views (read-only) --------------------
 def employee_app():
-    hero("ARK — Employee", "Your availability, jobs, and schedule")
     top_bar()
     au = st.session_state["auth_user"]
+    st.title("ARK — Employee Portal")
 
-    emp = fetch_df("SELECT id, name FROM employees WHERE id=?", (au.get("employee_id"),)) if au.get("employee_id") else pd.DataFrame()
+    emp = fetch_df("SELECT id, name FROM employees WHERE id=?", (au["employee_id"],)) if au.get("employee_id") else pd.DataFrame()
     emp_name = emp.iloc[0]["name"] if not emp.empty else None
     if not emp_name:
         st.warning("Your account is not linked to an employee record yet. Ask an admin to link it in User Management.")
@@ -688,14 +549,14 @@ def employee_app():
     with tabs[0]:
         if emp_name:
             st.subheader(f"Availability for {emp_name}")
-            shifts = fetch_df("SELECT weekday, start, end FROM employee_shifts WHERE employee_id=? ORDER BY weekday", (au["employee_id"],))
+            shifts = fetch_df("""SELECT weekday, start, end FROM employee_shifts WHERE employee_id=? ORDER BY weekday""", (au["employee_id"],))
             if not shifts.empty:
                 shifts["weekday"] = shifts["weekday"].map({0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"})
             st.markdown("**Shifts**")
-            st.dataframe(shifts, use_container_width=True)
+            st.dataframe(shifts)
             offs = fetch_df("SELECT off_date FROM employee_days_off WHERE employee_id=? ORDER BY off_date", (au["employee_id"],))
             st.markdown("**Days Off**")
-            st.dataframe(offs, use_container_width=True)
+            st.dataframe(offs)
         else:
             st.info("No linked employee record.")
 
@@ -707,16 +568,16 @@ def employee_app():
             st.info("No schedule generated yet. Ask an admin to run the scheduler.")
         else:
             wdf = df[df["Assigned To"]==emp_name] if emp_name else pd.DataFrame()
-            st.dataframe(wdf, use_container_width=True)
+            st.dataframe(wdf)
             if not wdf.empty:
                 wcsv = wdf.to_csv(index=False).encode("utf-8")
                 st.download_button(f"Download my schedule.csv", data=wcsv, file_name=f"schedule_{emp_name or 'me'}.csv", mime="text/csv")
 
-    # Active Jobs
+    # Active Jobs (read-only)
     with tabs[2]:
         st.subheader("Active Jobs")
         jobs = fetch_df("SELECT customer, job, service, stage_completed, qty FROM jobs ORDER BY customer, job")
-        st.dataframe(jobs, use_container_width=True)
+        st.dataframe(jobs)
 
     # Master Schedule
     with tabs[3]:
@@ -725,7 +586,7 @@ def employee_app():
         if df is None or df.empty:
             st.info("No schedule generated yet. Ask an admin to run the scheduler.")
         else:
-            st.dataframe(df.head(500), use_container_width=True)
+            st.dataframe(df.head(500))
             csv_bytes = df.to_csv(index=False).encode("utf-8")
             st.download_button("Download master schedule.csv", data=csv_bytes, file_name="schedule_master.csv", mime="text/csv")
 
@@ -804,10 +665,10 @@ def run_and_display_schedule():
         st.info("No schedule generated (check jobs/employees/shifts/rules).")
         return
     st.markdown("### Master Schedule")
-    st.dataframe(df.head(500), use_container_width=True)
+    st.dataframe(df.head(500))
 
     st.markdown("### Hours by Worker")
-    st.dataframe(df.groupby("Assigned To")["Hours"].sum().round(2).reset_index(), use_container_width=True)
+    st.dataframe(df.groupby("Assigned To")["Hours"].sum().round(2).reset_index())
 
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     st.download_button("Download master schedule.csv", data=csv_bytes, file_name="schedule_master.csv", mime="text/csv")
@@ -819,14 +680,14 @@ def run_and_display_schedule():
         for i, w in enumerate(workers):
             with emp_tabs[i]:
                 wdf = df[df["Assigned To"]==w].copy()
-                st.dataframe(wdf, use_container_width=True)
+                st.dataframe(wdf)
                 wcsv = wdf.to_csv(index=False).encode("utf-8")
                 st.download_button(f"Download {w} schedule.csv", data=wcsv, file_name=f"schedule_{w}.csv", mime="text/csv")
 
 # -------------------- User Management (admin) --------------------
 def user_management_view():
     st.subheader("User Management")
-    st.markdown("Create **admin** or **employee** accounts. Link employees for personalized schedules.")
+    st.markdown("Create **admin** or **employee** accounts. Employees can be linked to an employee record for personalized schedules.")
 
     # Create user
     with st.form("create_user"):
@@ -848,25 +709,19 @@ def user_management_view():
                     if link_emp != "(none)":
                         emp_id = int(emp_list.loc[emp_list["name"]==link_emp, "id"].values[0])
                     conn = get_conn(); cur = conn.cursor()
-                    cur.execute(
-                        """
-                        INSERT INTO users(name,email,role,password_hash,employee_id,active)
-                        VALUES (?,?,?,?,?,1)
-                        """ ,
-                        (name.strip(), email.strip().lower(), role, pwh, emp_id)
-                    )
+                    cur.execute("""INSERT INTO users(name,email,role,password_hash,employee_id,active)
+                                   VALUES (?,?,?,?,?,1)""",
+                                (name.strip(), email.strip().lower(), role, pwh, emp_id))
                     conn.commit(); conn.close()
                     st.success(f"Created {role} account for {name}.")
                 except Exception as e:
                     st.error(f"Could not create user: {e}")
 
     # Users table
-    users = fetch_df("""
-        SELECT u.id, u.name, u.email, u.role, u.active, e.name as employee
-        FROM users u LEFT JOIN employees e ON e.id=u.employee_id
-        ORDER BY u.role, u.name
-    """)
-    st.dataframe(users, use_container_width=True)
+    users = fetch_df("""SELECT u.id, u.name, u.email, u.role, u.active, e.name as employee
+                        FROM users u LEFT JOIN employees e ON e.id=u.employee_id
+                        ORDER BY u.role, u.name""")
+    st.dataframe(users)
 
     # Reset password / deactivate / relink
     if not users.empty:
@@ -881,8 +736,8 @@ def user_management_view():
                 try:
                     conn = get_conn(); cur = conn.cursor()
                     if action == "Reset password":
-                        if not new_pw.strip() or len(new_pw.strip()) < 8:
-                            st.warning("Enter a new password (min 8 chars)."); conn.close()
+                        if not new_pw.strip():
+                            st.warning("Enter a new password."); conn.close()
                         else:
                             pwh = hash_password(new_pw.strip())
                             cur.execute("UPDATE users SET password_hash=? WHERE id=?", (pwh, int(uid)))
@@ -908,16 +763,23 @@ def user_management_view():
 
 # -------------------- Main entry --------------------
 def main():
+    # Make sure DB schema exists and seed admin if needed
+    try:
+        init_db()
+    except Exception:
+        pass
+
+    au = st.session_state["auth_user"]
     try:
         if not users_exist():
             init_db()
     except Exception:
         init_db()
 
-    au = st.session_state["auth_user"]
     if not au:
         login_view()
         return
+
     if au["role"] == "admin":
         admin_app()
     else:
