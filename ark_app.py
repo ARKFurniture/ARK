@@ -364,18 +364,24 @@ def admin_app():
                         st.error(f"Could not delete shift: {e}")
 
         if not emp_df.empty:
-            with st.form("del_employee"):
+            
+with st.form("del_employee"):
                 st.markdown("**Delete an employee** (cascades to shifts/days-off/projects)")
-                emp_df["_label"] = emp_df.apply(lambda r: f"{r['id']} – {r['name']}", axis=1)
-                sel_emp = st.selectbox("Employee", emp_df["_label"].tolist(), key="emp_delete_select")
+                # Build records so selectbox stores the full row (value), not just a label
+                emp_records = emp_df[["id","name","role","email"]].to_dict("records") if not emp_df.empty else []
+                sel_emp = st.selectbox("Employee", emp_records,
+                                       format_func=lambda r: f"{r['id']} – {r['name']} ({r.get('role','')})" if isinstance(r, dict) else "",
+                                       key="emp_delete_select")
                 confirm = st.checkbox("Type DELETE below and check this", value=False, key="emp_del_chk")
                 text_confirm = st.text_input("Type: DELETE to confirm", "", key="emp_del_text")
                 if st.form_submit_button("Delete employee"):
-                    if confirm and text_confirm.strip().upper() == "DELETE":
+                    if confirm and text_confirm.strip().upper() == "DELETE" and sel_emp:
                         try:
-                            emp_id = int(sel_emp.split(" – ")[0])
+                            emp_id = int(sel_emp["id"])
+                            # rely on FK cascade; just remove the employee row by id
                             execute("DELETE FROM employees WHERE id=?", (emp_id,))
                             st.success(f"Deleted employee id {emp_id}")
+                            st.rerun()
                         except Exception as e:
                             st.error(f"Could not delete employee: {e}")
                     else:
@@ -404,15 +410,19 @@ def admin_app():
         jobs_df = fetch_df("SELECT * FROM jobs ORDER BY id ASC")
         st.dataframe(jobs_df)
         if not jobs_df.empty:
-            with st.form("del_job"):
+            
+with st.form("del_job"):
                 st.markdown("**Delete a job**")
-                jobs_df["_label"] = jobs_df.apply(lambda r: f"{r['id']} – {r['customer']} | {r['qty']} x {r['job']} | {r['service']}", axis=1)
-                selection = st.selectbox("Job", jobs_df["_label"].tolist(), key="job_delete_select")
+                job_records = jobs_df[["id","customer","qty","job","service"]].to_dict("records") if not jobs_df.empty else []
+                sel_job = st.selectbox("Job", job_records,
+                                       format_func=lambda r: f"{r['id']} – {r['customer']} | {r['qty']} x {r['job']} | {r['service']}" if isinstance(r, dict) else "",
+                                       key="job_delete_select")
                 if st.form_submit_button("Delete job"):
                     try:
-                        jid = int(str(selection).split(" – ")[0])
+                        jid = int(sel_job["id"])
                         execute("DELETE FROM jobs WHERE id=?", (jid,))
                         st.success(f"Deleted job id {jid}")
+                        st.rerun()
                     except Exception as e:
                         st.error(f"Could not delete job: {e}")
 
@@ -447,22 +457,27 @@ def admin_app():
                             FROM special_projects sp JOIN employees e ON e.id=sp.employee_id
                             ORDER BY sp.start_ts""")
         st.dataframe(sp_df)
+        # Delete special project block
         if not sp_df.empty:
             with st.form("del_sp"):
                 st.markdown("**Delete a special project block**")
-                sp_df["_label"] = sp_df.apply(lambda r: f"{r['id']} – {r['employee']} | {r['label']} | {r['start_ts']} → {r['end_ts']}", axis=1)
-                sel_sp = st.selectbox("Special project", sp_df["_label"].tolist(), key="sp_delete_select")
+                sp_records = sp_df[["id","employee","label","start_ts","end_ts"]].to_dict("records")
+                sel_sp = st.selectbox("Special project", sp_records,
+                                      format_func=lambda r: f"{r['id']} – {r['employee']} | {r['label']} | {r['start_ts']} → {r['end_ts']}",
+                                      key="sp_delete_select")
                 confirm_sp = st.checkbox("Confirm delete", value=False, key="sp_del_chk")
                 if st.form_submit_button("Delete block"):
-                    if confirm_sp:
+                    if confirm_sp and sel_sp:
                         try:
-                            sp_id = int(str(sel_sp).split(" – ")[0])
+                            sp_id = int(sel_sp["id"])
                             execute("DELETE FROM special_projects WHERE id=?", (sp_id,))
                             st.success(f"Deleted special project id {sp_id}")
+                            st.rerun()
                         except Exception as e:
                             st.error(f"Could not delete special project: {e}")
                     else:
                         st.warning("Please confirm deletion.")
+
 
     # Time Off
     with tabs[3]:
