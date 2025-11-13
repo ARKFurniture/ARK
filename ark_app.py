@@ -1199,6 +1199,135 @@ def batch_like_tasks(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     return out
 
 # -------------------- Carryover injection into next-day schedule --------------------
+def align_to_shifts_and_left_pack(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Align tasks to each employee's shift windows and left-pack them inside each shift.
+
+    * Reads actual shift definitions from the database (employee_shifts).
+    * Ensures tasks do not move earlier than their original start time
+      so we don't break curing / wait constraints.
+    * Packs tasks to the left within each shift to remove artificial gaps.
+    * Does **not** create new splits itself – it assumes upstream passes avoid
+      cross-day / cross-shift spans and only adjusts ordering and start times
+      inside each shift window.
+    """
+    if df is None or df.empty:
+        return df
+
+    c_emp = _find_col(df, "Assigned To", "Employee", "Worker")
+    c_sta = _find_col(df, "Start", "Start Time", "start")
+    c_end = _find_col(df, "End", "End Time", "end")
+    c_hrs = _find_col(df, "Hours", "Duration", "hours")
+    if any(c is None for c in [c_emp, c_sta, c_end]):
+        return df
+
+    w = df.copy()
+    w[c_sta] = pd.to_datetime(w[c_sta], errors="coerce")
+    w[c_end] = pd.to_datetime(w[c_end], errors="coerce")
+    if c_hrs is None:
+        w["__Hours__"] = (w[c_end] - w[c_sta]).dt.total_seconds() / 3600.0
+        c_hours = "__Hours__"
+    else:
+        c_hours = c_hrs
+
+    name_to_id = _build_name_to_id()
+    out_rows = []
+
+    # Sort by employee and time for deterministic behaviour
+    w = w.sort_values([c_emp, c_sta, c_end]).reset_index(drop=True)
+
+    for emp_name, gemp in w.groupby(c_emp, sort=False):
+        emp_id = name_to_id.get(str(emp_name))
+        gemp = gemp.copy()
+        gemp["__day__"] = gemp[c_sta].dt.date
+
+        # Process one day at a time
+        for day, gday in gemp.groupby("__day__", sort=False):
+            if pd.isna(day):
+                # If something is off, keep as-is
+                out_rows.extend(gday.to_dict("records"))
+                continue
+
+            # Look up shift segments for this employee and weekday
+            weekday = day.weekday()
+            segments = _day_shifts_for_employee(emp_id, weekday) if emp_id is not None else []
+
+            if not segments:
+                # No explicit shifts: keep original schedule for this day
+                out_rows.extend(gday.to_dict("records"))
+                continue
+
+            gday = gday.sort_values([c_sta, c_end]).copy()
+            used_idx = set()
+
+            for start_hhmm, end_hhmm in segments:
+                seg_start = _hhmm_to_dt(day, start_hhmm)
+                seg_end = _hhmm_to_dt(day, end_hhmm)
+                if seg_end <= seg_start:
+                    continue
+
+                # Tasks that start inside this shift window
+                seg_mask = (gday[c_sta] >= seg_start) & (gday[c_sta] < seg_end)
+                seg_tasks = gday[seg_mask].copy()
+                if seg_tasks.empty:
+                    continue
+
+                cursor = seg_start
+
+                for idx_row, row in seg_tasks.iterrows():
+                    dur = float(row.get(c_hours, 0.0) or 0.0)
+                    if dur <= 0:
+                        out_rows.append(row.to_dict())
+                        used_idx.add(idx_row)
+                        continue
+
+                    orig_start = row[c_sta]
+                    earliest = max(orig_start, seg_start)
+                    # Never move earlier than the original start
+                    new_start = max(cursor, earliest)
+                    if new_start >= seg_end:
+                        # No room left in this segment; keep original for this row
+                        out_rows.append(row.to_dict())
+                        used_idx.add(idx_row)
+                        continue
+
+                    new_end = new_start + pd.Timedelta(hours=dur)
+                    if new_end > seg_end:
+                        # If the task no longer fits fully inside the shift,
+                        # fall back to the original timing for safety.
+                        out_rows.append(row.to_dict())
+                        used_idx.add(idx_row)
+                        continue
+
+                    rr = row.to_dict()
+                    rr[c_sta] = new_start
+                    rr[c_end] = new_end
+                    rr[c_hours] = dur
+                    out_rows.append(rr)
+                    used_idx.add(idx_row)
+                    cursor = new_end
+
+            # Any rows for this day that weren't handled by a shift segment
+            # are kept as originally scheduled.
+            for idx_row, row in gday.iterrows():
+                if idx_row not in used_idx:
+                    out_rows.append(row.to_dict())
+
+    out = pd.DataFrame(out_rows)
+    try:
+        out[c_sta] = pd.to_datetime(out[c_sta])
+        out[c_end] = pd.to_datetime(out[c_end])
+        out[c_hours] = (out[c_end] - out[c_sta]).dt.total_seconds() / 3600.0
+    except Exception:
+        pass
+
+    # Restore original column order plus any extras on the right
+    orig_cols = df.columns.tolist()
+    extra_cols = [c for c in out.columns if c not in orig_cols]
+    out = out[[c for c in orig_cols if c in out.columns] + extra_cols]
+    out = out.sort_values([c_emp, c_sta, c_end]).reset_index(drop=True)
+    return out
+
 def _build_name_to_id():
     try:
         df = fetch_df("SELECT id, name FROM employees")
@@ -1386,6 +1515,10 @@ def run_scheduler_cached():
             pass
         try:
             df = batch_like_tasks(df, cfg)
+        except Exception:
+            pass
+        try:
+            df = align_to_shifts_and_left_pack(df)
         except Exception:
             pass
 
