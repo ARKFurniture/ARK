@@ -716,7 +716,8 @@ def employee_app():
     emp_name = emp.iloc[0]["name"] if not emp.empty else None
     if not emp_name:
         st.warning("Your account is not linked to an employee record yet. Ask an admin to link it in User Management.")
-    tabs = st.tabs(["My Availability", "My Schedule", "Today's Tasks", "Active Jobs", "Master Schedule"])
+
+    tabs = st.tabs(["My Availability", "Today's Tasks", "My Schedule", "Active Jobs", "Master Schedule"])
 
     # My Availability
     with tabs[0]:
@@ -726,100 +727,116 @@ def employee_app():
             if not shifts.empty:
                 shifts["weekday"] = shifts["weekday"].map({0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"})
             st.markdown("**Shifts**")
-            st.dataframe(shifts)
+            st.dataframe(shifts, use_container_width=True)
             offs = fetch_df("SELECT off_date FROM employee_days_off WHERE employee_id=? ORDER BY off_date", (au["employee_id"],))
             st.markdown("**Days Off**")
-            st.dataframe(offs)
+            st.dataframe(offs, use_container_width=True)
         else:
             st.info("No linked employee record.")
 
-    # My Schedule
+    # Today's Tasks
     with tabs[1]:
-        st.subheader("My Scheduled Tasks")
+        st.subheader("Today's Tasks")
+        df = run_scheduler_cached()
+        if df is None or df.empty or not emp_name:
+            st.info("No schedule generated yet or no linked employee record.")
+        else:
+            df = df.copy()
+            # Normalize the time columns
+            start_col = "Start" if "Start" in df.columns else ("Start Time" if "Start Time" in df.columns else None)
+            end_col   = "End" if "End" in df.columns else ("End Time" if "End Time" in df.columns else None)
+            who_col   = "Assigned To" if "Assigned To" in df.columns else ("Employee" if "Employee" in df.columns else None)
+            if not start_col or not end_col or not who_col:
+                st.warning("Schedule is missing expected columns.")
+            else:
+                df[start_col] = pd.to_datetime(df[start_col], errors="coerce")
+                df[end_col]   = pd.to_datetime(df[end_col], errors="coerce")
+                today = pd.Timestamp.now().date()
+                mine = df[(df[who_col] == emp_name) & (df[start_col].dt.date == today)].copy()
+                if mine.empty:
+                    st.info("No tasks scheduled for today.")
+                else:
+                    # Create readable label and editable columns
+                    disp_cols = ["Customer","Job","Service","Stage"]
+                    disp_cols = [c for c in disp_cols if c in mine.columns]
+                    show = mine[disp_cols + [start_col, end_col]].copy()
+                    show.rename(columns={start_col:"Start", end_col:"End"}, inplace=True)
+                    show["Not Done"] = False
+                    show["Percent Complete"] = 100
+                    st.caption("Check **Not Done** for any task you couldn't finish. Adjust **Percent Complete** as needed and submit.")
+                    edited = st.data_editor(
+                        show,
+                        hide_index=True,
+                        use_container_width=True,
+                        column_config={
+                            "Not Done": st.column_config.CheckboxColumn(),
+                            "Percent Complete": st.column_config.NumberColumn(min_value=0, max_value=100, step=5, help="0–100")
+                        },
+                        num_rows="fixed",
+                        key="today_tasks_editor"
+                    )
+
+                    # Persist feedback
+                    if st.button("Submit daily updates", type="primary"):
+                        # Ensure feedback table exists
+                        execute("""
+                        CREATE TABLE IF NOT EXISTS task_feedback(
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            date TEXT NOT NULL,
+                            employee TEXT NOT NULL,
+                            customer TEXT,
+                            job TEXT,
+                            service TEXT,
+                            stage TEXT,
+                            start_ts TEXT,
+                            end_ts TEXT,
+                            not_done INTEGER NOT NULL DEFAULT 0,
+                            percent_complete REAL NOT NULL DEFAULT 100,
+                            submitted_at TEXT NOT NULL DEFAULT (datetime('now'))
+                        );""")
+                        saved = 0
+                        for _, r in edited.iterrows():
+                            nd = 1 if r.get("Not Done", False) else 0
+                            pc = float(r.get("Percent Complete", 100) or 0)
+                            # sanitize
+                            if pc < 0: pc = 0
+                            if pc > 100: pc = 100
+                            vals = (
+                                str(pd.Timestamp(today).date()),
+                                emp_name,
+                                str(r.get("Customer","")),
+                                str(r.get("Job","")),
+                                str(r.get("Service","")),
+                                str(r.get("Stage","")),
+                                str(r.get("Start","")),
+                                str(r.get("End","")),
+                                nd,
+                                pc
+                            )
+                            execute("""INSERT INTO task_feedback
+                                (date, employee, customer, job, service, stage, start_ts, end_ts, not_done, percent_complete)
+                                VALUES (?,?,?,?,?,?,?,?,?,?)""", vals)
+                            saved += 1
+                        st.success(f"Saved {saved} task update(s). These will be applied when the next schedule is generated.")
+
+    # My Schedule
+    with tabs[2]:
+        st.subheader("My Scheduled Tasks (full window)")
         df = run_scheduler_cached()
         if df is None or df.empty:
             st.info("No schedule generated yet. Ask an admin to run the scheduler.")
         else:
             wdf = df[df["Assigned To"]==emp_name] if emp_name else pd.DataFrame()
-            st.dataframe(wdf)
+            st.dataframe(wdf, use_container_width=True)
             if not wdf.empty:
                 wcsv = wdf.to_csv(index=False).encode("utf-8")
                 st.download_button(f"Download my schedule.csv", data=wcsv, file_name=f"schedule_{emp_name or 'me'}.csv", mime="text/csv")
-
-    # Today's Tasks + progress (NEW)
-    with tabs[2]:
-        st.subheader("Today's Tasks & Progress")
-        df = run_scheduler_cached()
-        if df is None or df.empty or not emp_name:
-            st.info("No schedule generated yet.")
-        else:
-            # Filter by today's date (or allow override)
-            today_dt = date.today()
-            work_date = st.date_input("Work date", value=today_dt, key="work_date_emp")
-            sdf = df[df["Assigned To"]==emp_name].copy()
-            if "Start" in sdf.columns:
-                sdf["__day__"] = pd.to_datetime(sdf["Start"], errors="coerce").dt.date
-                sdf = sdf[sdf["__day__"]==work_date]
-            if sdf.empty:
-                st.info("No tasks scheduled for the selected date.")
-            else:
-                keep_cols = [c for c in ["Start","End","Customer","Job","Service","Stage","Item","Hours"] if c in sdf.columns]
-                st.dataframe(sdf[keep_cols])
-                st.caption("Tick the tasks you **did not** finish today and estimate how much you completed. We'll roll the remainder to tomorrow.")
-                with st.form("task_progress_form", clear_on_submit=True):
-                    not_done_flags = []
-                    percent_done_vals = []
-                    notes_vals = []
-                    for i, (_, row) in enumerate(sdf.iterrows()):
-                        desc = f"{row.get('Start','')} → {row.get('End','')}  •  {row.get('Customer','')}  •  {row.get('Job','')}  •  {row.get('Service','')}  •  {row.get('Stage','')}"
-                        chk = st.checkbox(f"Not done: {desc}", key=f"nd_{i}")
-                        pct = 0
-                        note = ""
-                        if chk:
-                            pct = st.slider(f"Percent completed for task #{i+1}", min_value=0, max_value=99, value=0, step=5, key=f"pct_{i}")
-                            note = st.text_input(f"Notes for task #{i+1}", "", key=f"note_{i}")
-                        not_done_flags.append(chk)
-                        percent_done_vals.append(pct)
-                        notes_vals.append(note)
-                    submit = st.form_submit_button("Submit progress")
-                if submit:
-                    inserted = 0
-                    for i, (_, row) in enumerate(sdf.iterrows()):
-                        if not_done_flags[i]:
-                            hrs = float(row.get("Hours", 0.0) or 0.0)
-                            done_frac = max(0.0, min(0.99, (percent_done_vals[i] or 0)/100.0))
-                            hrs_rem = round(max(0.0, hrs*(1.0-done_frac)), 3)
-                            if hrs_rem <= 0:
-                                continue
-                            carry_to = work_date + timedelta(days=1)
-                            try:
-                                execute("""INSERT INTO task_carryovers(employee,customer,job,service,stage,qty_index,hours_planned,hours_done,hours_remaining,on_date,carry_to,notes,consumed)
-                                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)""",
-                                        (emp_name,
-                                         str(row.get("Customer","")),
-                                         str(row.get("Job","")),
-                                         str(row.get("Service","")),
-                                         str(row.get("Stage","")),
-                                         str(row.get("Item","")),
-                                         float(row.get("Hours",0.0) or 0.0),
-                                         float(hrs - hrs_rem),
-                                         float(hrs_rem),
-                                         str(work_date),
-                                         str(carry_to),
-                                         str(notes_vals[i] or "")))
-                                inserted += 1
-                            except Exception as e:
-                                st.error(f"Could not record carryover for row {i+1}: {e}")
-                    if inserted > 0:
-                        st.success(f"Recorded {inserted} carryover task(s). Re-run the scheduler to apply.")
-                    else:
-                        st.info("No carryovers recorded.")
 
     # Active Jobs (read-only)
     with tabs[3]:
         st.subheader("Active Jobs")
         jobs = fetch_df("SELECT customer, job, service, stage_completed, qty FROM jobs ORDER BY id ASC")
-        st.dataframe(jobs)
+        st.dataframe(jobs, use_container_width=True)
 
     # Master Schedule
     with tabs[4]:
@@ -828,11 +845,10 @@ def employee_app():
         if df is None or df.empty:
             st.info("No schedule generated yet. Ask an admin to run the scheduler.")
         else:
-            st.dataframe(df.head(500))
+            st.dataframe(df.head(500), use_container_width=True)
             csv_bytes = df.to_csv(index=False).encode("utf-8")
             st.download_button("Download master schedule.csv", data=csv_bytes, file_name="schedule_master.csv", mime="text/csv")
 
-# -------------------- Scheduling post-processors --------------------
 def _find_col(df, *cands):
     cols = {c.lower(): c for c in df.columns}
     for c in cands:
@@ -865,30 +881,42 @@ def _build_deadline_map(cfg: dict):
         pass
     return dl_map
 
+# -------------------- Non-preemptive & shift-aware post-processor --------------------
 def enforce_non_preemptive_finish_started(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """
-    Enforce "finish-what-you-start" within each employee's day, with deadline-only override.
-    Does not preempt mid-stage; only reorders within the same day for the same employee.
-    If a deadline (Priorities → Targets) would be missed by finishing first, we keep original order.
+    Make schedule less "twitchy":
+      • If an employee starts a task (same piece/stage/item), finish it before switching.
+      • Only reorder within the same employee + same day.
+      • Do NOT cross shift boundaries (respects each employee's daily shift windows).
+      • If finishing-first would violate a deadline target (earlier than the merged end), do not merge.
     """
     if df is None or df.empty:
         return df
 
-    c_emp  = _find_col(df, "Assigned To", "Employee", "Worker")
-    c_sta  = _find_col(df, "Start", "Start Time", "start")
-    c_end  = _find_col(df, "End", "End Time", "end")
-    c_hrs  = _find_col(df, "Hours", "Duration", "hours")
-    c_cust = _find_col(df, "Customer", "customer", "Client")
-    c_job  = _find_col(df, "Job", "job", "Piece")
-    c_srv  = _find_col(df, "Service", "service", "Workflow")
-    c_stg  = _find_col(df, "Stage", "stage", "Status")
-    c_item = _find_col(df, "Item", "Qty Index", "Index")
+    # Helper to find a column by any of the provided display names
+    def find_col(df, *cands):
+        cols = {c.lower(): c for c in df.columns}
+        for c in cands:
+            if c.lower() in cols:
+                return cols[c.lower()]
+        return None
+
+    c_emp  = find_col(df, "Assigned To", "Employee", "Worker")
+    c_sta  = find_col(df, "Start", "Start Time", "start")
+    c_end  = find_col(df, "End", "End Time", "end")
+    c_hrs  = find_col(df, "Hours", "Duration", "hours")
+    c_cust = find_col(df, "Customer", "customer", "Client")
+    c_job  = find_col(df, "Job", "job", "Piece")
+    c_srv  = find_col(df, "Service", "service", "Workflow")
+    c_stg  = find_col(df, "Stage", "stage", "Status")
+    c_item = find_col(df, "Item", "Qty Index", "Index")
 
     req = [c_emp, c_sta, c_end, c_cust, c_job, c_srv, c_stg]
     if any(c is None for c in req):
-        return df  # Best-effort
+        return df  # if unexpected columns, return as-is
 
     wdf = df.copy()
+    # Parse datetimes
     wdf[c_sta] = pd.to_datetime(wdf[c_sta], errors="coerce")
     wdf[c_end] = pd.to_datetime(wdf[c_end], errors="coerce")
     if c_hrs is None:
@@ -897,8 +925,57 @@ def enforce_non_preemptive_finish_started(df: pd.DataFrame, cfg: dict) -> pd.Dat
     else:
         c_hours = c_hrs
 
-    dl_map = _build_deadline_map(cfg)
+    # Build deadlines map from cfg.priorities.targets
+    import pandas as _pd
+    dl_map = {}  # key: (customer_lower, stage_lower) -> earliest deadline pd.Timestamp
+    try:
+        for t in (cfg or {}).get("priorities", {}).get("targets", []):
+            cust = str(t.get("customer","")).strip().lower()
+            stg  = str(t.get("stage","")).strip().lower()
+            by   = _pd.to_datetime(str(t.get("by","")), errors="coerce")
+            if _pd.isna(by):
+                continue
+            key = (cust, stg)
+            if key not in dl_map or by < dl_map[key]:
+                dl_map[key] = by
+    except Exception:
+        dl_map = {}
 
+    # Build quick shift lookup: emp -> weekday (0=Mon) -> list[(start_time,end_time)] in HH:MM
+    from datetime import datetime as _dt
+    emp_shift = {}
+    try:
+        for e in (cfg or {}).get("employees", []):
+            name = e.get("name")
+            emp_shift[name] = {d: [] for d in range(7)}
+            for s in e.get("shifts", []):
+                for d in s.get("days", []):
+                    emp_shift[name].setdefault(int(d), [])
+                    emp_shift[name][int(d)].append((str(s.get("start","08:00")), str(s.get("end","16:00"))))
+            # Sort segments during a day
+            for d in emp_shift[name]:
+                emp_shift[name][d] = sorted(emp_shift[name][d])
+    except Exception:
+        pass
+
+    def day_segments_for(emp_name: str, day_date: _dt.date):
+        """Return list of (seg_start_ts, seg_end_ts) for this employee on this specific date."""
+        wd = day_date.weekday()  # Mon=0
+        segs = []
+        for hhmm_start, hhmm_end in emp_shift.get(emp_name, {}).get(wd, []):
+            try:
+                s_h, s_m = [int(x) for x in hhmm_start.split(":")]
+                e_h, e_m = [int(x) for x in hhmm_end.split(":")]
+            except Exception:
+                s_h, s_m, e_h, e_m = 8, 0, 16, 0
+            s_ts = _pd.Timestamp(year=day_date.year, month=day_date.month, day=day_date.day, hour=s_h, minute=s_m)
+            e_ts = _pd.Timestamp(year=day_date.year, month=day_date.month, day=day_date.day, hour=e_h, minute=e_m)
+            if _pd.isna(s_ts) or _pd.isna(e_ts) or s_ts >= e_ts:
+                continue
+            segs.append((s_ts, e_ts))
+        return segs
+
+    # Helper to build a task key (same piece-stage)
     def task_key(row):
         base = (str(row.get(c_cust,"")), str(row.get(c_job,"")), str(row.get(c_srv,"")), str(row.get(c_stg,"")))
         if c_item and c_item in row:
@@ -906,6 +983,8 @@ def enforce_non_preemptive_finish_started(df: pd.DataFrame, cfg: dict) -> pd.Dat
         return base
 
     out_rows = []
+
+    # Process per employee
     wdf = wdf.sort_values([c_emp, c_sta, c_end]).reset_index(drop=True)
     for emp, sub in wdf.groupby(c_emp, sort=False):
         if sub.empty:
@@ -917,69 +996,119 @@ def enforce_non_preemptive_finish_started(df: pd.DataFrame, cfg: dict) -> pd.Dat
             if day_df.empty:
                 continue
             day_df = day_df.sort_values([c_sta, c_end]).copy()
+            segments = day_segments_for(emp, day) or []
 
-            pending = [r.to_dict() for _, r in day_df.iterrows()]
-            cursor = day_df.iloc[0][c_sta]
+            # If we somehow don't have explicit segments, fall back to natural schedule bounds for that day
+            if not segments:
+                first = day_df[c_sta].min()
+                last  = day_df[c_end].max()
+                if pd.notna(first) and pd.notna(last) and first < last:
+                    segments = [(first.normalize() + pd.Timedelta(hours=8), first.normalize() + pd.Timedelta(hours=16))]
 
-            while pending:
-                r0 = pending.pop(0)
-                if pd.isna(r0[c_sta]) or pd.isna(r0[c_end]):
-                    continue
-                start0 = max(cursor, r0[c_sta])
-                dur0_h = float(r0[c_hours]) if pd.notna(r0[c_hours]) else (r0[c_end] - r0[c_sta]).total_seconds()/3600.0
-                key0 = task_key(r0)
+            # For each segment independently (avoid crossing lunch/off-hours)
+            for seg_start, seg_end in segments:
+                # pending = rows in this segment window (intersecting)
+                pending = []
+                for _, r in day_df.iterrows():
+                    rs, re = r[c_sta], r[c_end]
+                    if pd.isna(rs) or pd.isna(re): 
+                        continue
+                    # If the row overlaps this segment at all
+                    if re > seg_start and rs < seg_end:
+                        # Clamp row within the segment just for sequencing decisions
+                        rr = r.to_dict()
+                        rr[c_sta] = max(rs, seg_start)
+                        rr[c_end] = min(re, seg_end)
+                        if rr[c_end] > rr[c_sta]:
+                            # Use clamped hours for the merge logic
+                            rr[c_hours] = (pd.to_datetime(rr[c_end]) - pd.to_datetime(rr[c_sta])).total_seconds()/3600.0
+                            pending.append(rr)
 
-                same_idxs = []
-                total_h = dur0_h
-                for i in range(len(pending)):
-                    ri = pending[i]
-                    if task_key(ri) == key0:
-                        dh = float(ri[c_hours]) if pd.notna(ri[c_hours]) else (ri[c_end] - ri[c_sta]).total_seconds()/3600.0
-                        same_idxs.append(i)
-                        total_h += dh
+                # Sort by clamped start/end
+                pending = sorted(pending, key=lambda r: (r[c_sta], r[c_end]))
 
-                proposed_end = start0 + pd.Timedelta(hours=total_h)
+                cursor = seg_start
+                used_indices = set()
 
-                violates_deadline = False
-                if dl_map:
-                    for ri in pending:
-                        if pd.isna(ri[c_sta]):
+                i = 0
+                while i < len(pending):
+                    r0 = pending[i]
+                    if i in used_indices:
+                        i += 1
+                        continue
+
+                    start0 = max(cursor, r0[c_sta])
+                    dur0_h = float(r0.get(c_hours, 0.0)) if pd.notna(r0.get(c_hours, None)) else (r0[c_end] - r0[c_sta]).total_seconds()/3600.0
+                    key0 = task_key(r0)
+
+                    # Collect same-task fragments that appear later in this segment
+                    same_idxs = []
+                    total_h = dur0_h
+                    for j in range(i+1, len(pending)):
+                        if j in used_indices:
                             continue
-                        if ri[c_sta] < proposed_end:
-                            dkey = (str(ri.get(c_cust,"")).strip().lower(), str(ri.get(c_stg,"")).strip().lower())
-                            dl = dl_map.get(dkey)
-                            if dl is not None and dl < proposed_end:
-                                violates_deadline = True
-                                break
+                        rj = pending[j]
+                        if task_key(rj) == key0:
+                            dh = float(rj.get(c_hours, 0.0)) if pd.notna(rj.get(c_hours, None)) else (rj[c_end] - rj[c_sta]).total_seconds()/3600.0
+                            same_idxs.append(j)
+                            total_h += dh
 
-                if violates_deadline:
-                    end0 = start0 + pd.Timedelta(hours=dur0_h)
-                    rr = dict(r0)
-                    rr[c_sta] = start0
-                    rr[c_end] = end0
-                    rr[c_hours] = dur0_h
-                    out_rows.append(rr)
-                    cursor = end0
-                else:
-                    for idx in sorted(same_idxs, reverse=True):
-                        pending.pop(idx)
-                    endm = proposed_end
-                    rr = dict(r0)
-                    rr[c_sta] = start0
-                    rr[c_end] = endm
-                    rr[c_hours] = total_h
-                    out_rows.append(rr)
-                    cursor = endm
+                    proposed_end = start0 + pd.Timedelta(hours=total_h)
+
+                    # Check deadline-only override
+                    violates_deadline = False
+                    if dl_map:
+                        for k in range(i+1, len(pending)):
+                            if k in used_indices or k in same_idxs:
+                                continue
+                            rk = pending[k]
+                            if rk[c_sta] < proposed_end:
+                                dkey = (str(rk.get(c_cust,"")).strip().lower(), str(rk.get(c_stg,"")).strip().lower())
+                                dl = dl_map.get(dkey)
+                                if dl is not None and dl < proposed_end:
+                                    violates_deadline = True
+                                    break
+
+                    # If merge would cross segment end, do not merge (keep original order)
+                    if proposed_end > seg_end:
+                        violates_deadline = True
+
+                    if violates_deadline:
+                        end0 = min(start0 + pd.Timedelta(hours=dur0_h), seg_end)
+                        rr = dict(r0)
+                        rr[c_sta] = start0
+                        rr[c_end] = end0
+                        rr[c_hours] = (end0 - start0).total_seconds()/3600.0
+                        out_rows.append(rr)
+                        cursor = end0
+                        used_indices.add(i)
+                        i += 1
+                    else:
+                        # Consume the same-task fragments
+                        for j in same_idxs:
+                            used_indices.add(j)
+                        endm = min(proposed_end, seg_end)
+                        rr = dict(r0)
+                        rr[c_sta] = start0
+                        rr[c_end] = endm
+                        rr[c_hours] = (endm - start0).total_seconds()/3600.0
+                        out_rows.append(rr)
+                        cursor = endm
+                        used_indices.add(i)
+                        i += 1
 
     out = pd.DataFrame(out_rows) if out_rows else wdf
+    # Recompute exact Hours and sort nicely
     try:
-        out[c_hours] = (pd.to_datetime(out[c_end]) - pd.to_datetime(out[c_sta])).dt.total_seconds()/3600.0
+        out[c_sta] = pd.to_datetime(out[c_sta]); out[c_end] = pd.to_datetime(out[c_end])
+        out[c_hours] = (out[c_end] - out[c_sta]).dt.total_seconds()/3600.0
     except Exception:
         pass
     out = out.sort_values([c_emp, c_sta, c_end]).reset_index(drop=True)
+    # Restore original columns first, then any extras
     cols = df.columns.tolist()
-    extra = [c for c in out.columns if c not in cols]
-    out = out[[c for c in cols if c in out.columns] + extra]
+    extras = [c for c in out.columns if c not in cols]
+    out = out[[c for c in cols if c in out.columns] + extras]
     return out
 
 def batch_like_tasks(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
