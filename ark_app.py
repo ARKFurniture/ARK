@@ -1,8 +1,8 @@
-
+# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
-import json, os, sqlite3, tempfile, hashlib, binascii
-from datetime import date
+import json, os, sqlite3, tempfile, hashlib, binascii, re
+from datetime import date, datetime, timedelta
 import ark_scheduler as ark
 from ark_dictionary import DICT_CSV
 
@@ -183,6 +183,7 @@ def init_db():
         cur.execute("""INSERT INTO global_settings
             (id, window_start, window_end, gap_after_finish_hours, gap_before_assembly_hours, assembly_earliest_hour)
             VALUES (1, '2025-11-12 08:00', '2025-11-23 23:59', 2, 12, 9)""")
+
     # Users
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users(
@@ -194,6 +195,26 @@ def init_db():
         employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
         active INTEGER NOT NULL DEFAULT 1
     );""")
+
+    # Employee task carryovers (NEW)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS task_carryovers(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        employee TEXT NOT NULL,
+        customer TEXT NOT NULL,
+        job TEXT NOT NULL,
+        service TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        qty_index TEXT,
+        hours_planned REAL NOT NULL,
+        hours_done REAL NOT NULL,
+        hours_remaining REAL NOT NULL,
+        on_date TEXT NOT NULL,
+        carry_to TEXT NOT NULL,
+        notes TEXT,
+        consumed INTEGER NOT NULL DEFAULT 0
+    );""")
+
     # Pre-seed requested admin if not present
     cur.execute("SELECT id FROM users WHERE lower(email)=lower(?)", ('info@arkfurniture.ca',))
     row = cur.fetchone()
@@ -256,7 +277,7 @@ def login_view():
                 return
             st.session_state["auth_user"] = {"id": uid, "name": name, "email": email2, "role": role, "employee_id": emp_id}
             st.success(f"Welcome, {name} ({role})")
-            st.experimental_rerun()
+            st.rerun()
         except Exception as e:
             st.exception(e)
 
@@ -289,12 +310,12 @@ def top_bar():
                         conn.commit(); conn.close()
                         st.success("Password updated. Please sign in again.")
                         st.session_state["auth_user"] = None
-                        st.experimental_rerun()
+                        st.rerun()
                 except Exception as e:
                     st.error(f"Could not change password: {e}")
     if st.sidebar.button("Sign out"):
         st.session_state["auth_user"] = None
-        st.experimental_rerun()
+        st.rerun()
 
 # -------------------- Admin views --------------------
 def admin_app():
@@ -364,8 +385,6 @@ def admin_app():
                         st.error(f"Could not delete shift: {e}")
 
         if not emp_df.empty:
-            
-            
             with st.form("del_employee"):
                 st.markdown("**Delete an employee** (cascades to shifts/days-off/projects)")
                 if "id" not in emp_df.columns or emp_df.empty:
@@ -396,13 +415,12 @@ def admin_app():
                         else:
                             st.warning("Please confirm deletion by typing DELETE and checking the box.")
 
-
     # Jobs
     with tabs[1]:
         st.subheader("Jobs")
         svc = st.selectbox("Service", SERVICES, index=0, key="job_service")
         stage_options = ["Not Started"] + SERVICE_STAGE_ORDERS[svc]
-        piece = st.selectbox("Job Type (Piece)", PIECE_TYPES, index=PIECE_TYPES.index("Dining Table") if "Dining Table" in PIECE_TYPES else 0)
+        piece = st.selectbox("Job Type (Piece)", PIECE_TYPES, index=(PIECE_TYPES.index("Dining Table") if "Dining Table" in PIECE_TYPES else 0))
         c1,c2,c3 = st.columns(3)
         customer = c1.text_input("Customer")
         stage_completed = c2.selectbox("Stage completed", stage_options, index=0, key="job_stage")
@@ -420,8 +438,6 @@ def admin_app():
         jobs_df = fetch_df("SELECT * FROM jobs ORDER BY id ASC")
         st.dataframe(jobs_df)
         if not jobs_df.empty:
-            
-            
             with st.form("del_job"):
                 st.markdown("**Delete a job**")
                 if "id" not in jobs_df.columns or jobs_df.empty:
@@ -448,8 +464,7 @@ def admin_app():
                         except Exception as e:
                             st.error(f"Could not delete job: {e}")
 
-
-# --- Import jobs from CSV ---
+        # --- Import jobs from CSV ---
         with st.expander("Import jobs from CSV", expanded=False):
             st.caption("Columns supported: customer, job, service, qty, stage_completed, due_date, priority, notes")
             template = (
@@ -463,7 +478,6 @@ def admin_app():
             dedup = st.checkbox("Skip duplicates (customer + job + service + stage + qty)", value=True, key="jobs_csv_dedup")
 
             if up is not None:
-                import pandas as pd
                 try:
                     df_csv = pd.read_csv(up)
                 except Exception as e:
@@ -605,7 +619,6 @@ def admin_app():
                     except Exception as e:
                         st.error(f"Could not delete special project: {e}")
 
-
     # Time Off
     with tabs[3]:
         st.subheader("Time Off (full days)")
@@ -655,7 +668,7 @@ def admin_app():
         with st.form("add_target"):
             c1,c2,c3 = st.columns(3)
             cust2 = c1.selectbox("Customer", cust_list) if cust_list else c1.text_input("Customer")
-            stage = c2.selectbox("Stage", stage_list, index=stage_list.index("Assembly") if "Assembly" in stage_list else 0)
+            stage = c2.selectbox("Stage", stage_list, index=(stage_list.index("Assembly") if "Assembly" in stage_list else 0))
             by_dt = c3.date_input("By date", value=date(2025,11,14))
             ok2 = st.form_submit_button("Add target")
             if ok2 and ((cust_list and cust2) or (not cust_list and str(cust2).strip())):
@@ -693,7 +706,7 @@ def admin_app():
     with tabs[6]:
         user_management_view()
 
-# -------------------- Employee views (read-only) --------------------
+# -------------------- Employee views (read-only + feedback) --------------------
 def employee_app():
     top_bar()
     au = st.session_state["auth_user"]
@@ -703,7 +716,7 @@ def employee_app():
     emp_name = emp.iloc[0]["name"] if not emp.empty else None
     if not emp_name:
         st.warning("Your account is not linked to an employee record yet. Ask an admin to link it in User Management.")
-    tabs = st.tabs(["My Availability", "My Schedule", "Active Jobs", "Master Schedule"])
+    tabs = st.tabs(["My Availability", "My Schedule", "Today's Tasks", "Active Jobs", "Master Schedule"])
 
     # My Availability
     with tabs[0]:
@@ -733,14 +746,83 @@ def employee_app():
                 wcsv = wdf.to_csv(index=False).encode("utf-8")
                 st.download_button(f"Download my schedule.csv", data=wcsv, file_name=f"schedule_{emp_name or 'me'}.csv", mime="text/csv")
 
-    # Active Jobs (read-only)
+    # Today's Tasks + progress (NEW)
     with tabs[2]:
+        st.subheader("Today's Tasks & Progress")
+        df = run_scheduler_cached()
+        if df is None or df.empty or not emp_name:
+            st.info("No schedule generated yet.")
+        else:
+            # Filter by today's date (or allow override)
+            today_dt = date.today()
+            work_date = st.date_input("Work date", value=today_dt, key="work_date_emp")
+            sdf = df[df["Assigned To"]==emp_name].copy()
+            if "Start" in sdf.columns:
+                sdf["__day__"] = pd.to_datetime(sdf["Start"], errors="coerce").dt.date
+                sdf = sdf[sdf["__day__"]==work_date]
+            if sdf.empty:
+                st.info("No tasks scheduled for the selected date.")
+            else:
+                keep_cols = [c for c in ["Start","End","Customer","Job","Service","Stage","Item","Hours"] if c in sdf.columns]
+                st.dataframe(sdf[keep_cols])
+                st.caption("Tick the tasks you **did not** finish today and estimate how much you completed. We'll roll the remainder to tomorrow.")
+                with st.form("task_progress_form", clear_on_submit=True):
+                    not_done_flags = []
+                    percent_done_vals = []
+                    notes_vals = []
+                    for i, (_, row) in enumerate(sdf.iterrows()):
+                        desc = f"{row.get('Start','')} → {row.get('End','')}  •  {row.get('Customer','')}  •  {row.get('Job','')}  •  {row.get('Service','')}  •  {row.get('Stage','')}"
+                        chk = st.checkbox(f"Not done: {desc}", key=f"nd_{i}")
+                        pct = 0
+                        note = ""
+                        if chk:
+                            pct = st.slider(f"Percent completed for task #{i+1}", min_value=0, max_value=99, value=0, step=5, key=f"pct_{i}")
+                            note = st.text_input(f"Notes for task #{i+1}", "", key=f"note_{i}")
+                        not_done_flags.append(chk)
+                        percent_done_vals.append(pct)
+                        notes_vals.append(note)
+                    submit = st.form_submit_button("Submit progress")
+                if submit:
+                    inserted = 0
+                    for i, (_, row) in enumerate(sdf.iterrows()):
+                        if not_done_flags[i]:
+                            hrs = float(row.get("Hours", 0.0) or 0.0)
+                            done_frac = max(0.0, min(0.99, (percent_done_vals[i] or 0)/100.0))
+                            hrs_rem = round(max(0.0, hrs*(1.0-done_frac)), 3)
+                            if hrs_rem <= 0:
+                                continue
+                            carry_to = work_date + timedelta(days=1)
+                            try:
+                                execute("""INSERT INTO task_carryovers(employee,customer,job,service,stage,qty_index,hours_planned,hours_done,hours_remaining,on_date,carry_to,notes,consumed)
+                                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+                                        (emp_name,
+                                         str(row.get("Customer","")),
+                                         str(row.get("Job","")),
+                                         str(row.get("Service","")),
+                                         str(row.get("Stage","")),
+                                         str(row.get("Item","")),
+                                         float(row.get("Hours",0.0) or 0.0),
+                                         float(hrs - hrs_rem),
+                                         float(hrs_rem),
+                                         str(work_date),
+                                         str(carry_to),
+                                         str(notes_vals[i] or "")))
+                                inserted += 1
+                            except Exception as e:
+                                st.error(f"Could not record carryover for row {i+1}: {e}")
+                    if inserted > 0:
+                        st.success(f"Recorded {inserted} carryover task(s). Re-run the scheduler to apply.")
+                    else:
+                        st.info("No carryovers recorded.")
+
+    # Active Jobs (read-only)
+    with tabs[3]:
         st.subheader("Active Jobs")
         jobs = fetch_df("SELECT customer, job, service, stage_completed, qty FROM jobs ORDER BY id ASC")
         st.dataframe(jobs)
 
     # Master Schedule
-    with tabs[3]:
+    with tabs[4]:
         st.subheader("Master Schedule (read-only)")
         df = run_scheduler_cached()
         if df is None or df.empty:
@@ -750,52 +832,25 @@ def employee_app():
             csv_bytes = df.to_csv(index=False).encode("utf-8")
             st.download_button("Download master schedule.csv", data=csv_bytes, file_name="schedule_master.csv", mime="text/csv")
 
-# -------------------- Shared scheduling helpers --------------------
-# -------------------- Non-preemptive schedule post-processor --------------------
-def enforce_non_preemptive_finish_started(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
-    """
-    Enforce "finish-what-you-start" within each employee's day, with deadline-only override.
-    Does not preempt mid-stage; only reorders within the same day for the same employee.
-    If a deadline (Priorities → Targets) would be missed by finishing first, we keep original order.
-    """
-    if df is None or df.empty:
-        return df
+# -------------------- Scheduling post-processors --------------------
+def _find_col(df, *cands):
+    cols = {c.lower(): c for c in df.columns}
+    for c in cands:
+        if c.lower() in cols:
+            return cols[c.lower()]
+    return None
 
-    # Column detection
-    def find_col(df, *cands):
-        cols = {c.lower(): c for c in df.columns}
-        for c in cands:
-            if c.lower() in cols:
-                return cols[c.lower()]
-        return None
+def _stage_base(stage: str) -> str:
+    s = str(stage or "").strip().lower()
+    # normalize "paint 2" -> "paint", "clear3" -> "clear", etc.
+    s = s.replace("-", " ").replace("_"," ")
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\d+", "", s).strip()
+    return s
 
-    c_emp  = find_col(df, "Assigned To", "Employee", "Worker")
-    c_sta  = find_col(df, "Start", "Start Time", "start")
-    c_end  = find_col(df, "End", "End Time", "end")
-    c_hrs  = find_col(df, "Hours", "Duration", "hours")
-    c_cust = find_col(df, "Customer", "customer", "Client")
-    c_job  = find_col(df, "Job", "job", "Piece")
-    c_srv  = find_col(df, "Service", "service", "Workflow")
-    c_stg  = find_col(df, "Stage", "stage", "Status")
-    c_item = find_col(df, "Item", "Qty Index", "Index")
-
-    req = [c_emp, c_sta, c_end, c_cust, c_job, c_srv, c_stg]
-    if any(c is None for c in req):
-        return df  # Best-effort: columns missing; skip
-
-    wdf = df.copy()
-    # Parse datetimes
-    wdf[c_sta] = pd.to_datetime(wdf[c_sta], errors="coerce")
-    wdf[c_end] = pd.to_datetime(wdf[c_end], errors="coerce")
-    if c_hrs is None:
-        wdf["__Hours__"] = (wdf[c_end] - wdf[c_sta]).dt.total_seconds()/3600.0
-        c_hours = "__Hours__"
-    else:
-        c_hours = c_hrs
-
-    # Build deadlines map from cfg.priorities.targets
+def _build_deadline_map(cfg: dict):
     import pandas as _pd
-    dl_map = {}  # key: (customer_lower, stage_lower) -> earliest deadline pd.Timestamp
+    dl_map = {}
     try:
         for t in (cfg or {}).get("priorities", {}).get("targets", []):
             cust = str(t.get("customer","")).strip().lower()
@@ -807,9 +862,43 @@ def enforce_non_preemptive_finish_started(df: pd.DataFrame, cfg: dict) -> pd.Dat
             if key not in dl_map or by < dl_map[key]:
                 dl_map[key] = by
     except Exception:
-        dl_map = {}
+        pass
+    return dl_map
 
-    # Helper to build a task key (same piece-stage)
+def enforce_non_preemptive_finish_started(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """
+    Enforce "finish-what-you-start" within each employee's day, with deadline-only override.
+    Does not preempt mid-stage; only reorders within the same day for the same employee.
+    If a deadline (Priorities → Targets) would be missed by finishing first, we keep original order.
+    """
+    if df is None or df.empty:
+        return df
+
+    c_emp  = _find_col(df, "Assigned To", "Employee", "Worker")
+    c_sta  = _find_col(df, "Start", "Start Time", "start")
+    c_end  = _find_col(df, "End", "End Time", "end")
+    c_hrs  = _find_col(df, "Hours", "Duration", "hours")
+    c_cust = _find_col(df, "Customer", "customer", "Client")
+    c_job  = _find_col(df, "Job", "job", "Piece")
+    c_srv  = _find_col(df, "Service", "service", "Workflow")
+    c_stg  = _find_col(df, "Stage", "stage", "Status")
+    c_item = _find_col(df, "Item", "Qty Index", "Index")
+
+    req = [c_emp, c_sta, c_end, c_cust, c_job, c_srv, c_stg]
+    if any(c is None for c in req):
+        return df  # Best-effort
+
+    wdf = df.copy()
+    wdf[c_sta] = pd.to_datetime(wdf[c_sta], errors="coerce")
+    wdf[c_end] = pd.to_datetime(wdf[c_end], errors="coerce")
+    if c_hrs is None:
+        wdf["__Hours__"] = (wdf[c_end] - wdf[c_sta]).dt.total_seconds()/3600.0
+        c_hours = "__Hours__"
+    else:
+        c_hours = c_hrs
+
+    dl_map = _build_deadline_map(cfg)
+
     def task_key(row):
         base = (str(row.get(c_cust,"")), str(row.get(c_job,"")), str(row.get(c_srv,"")), str(row.get(c_stg,"")))
         if c_item and c_item in row:
@@ -817,8 +906,6 @@ def enforce_non_preemptive_finish_started(df: pd.DataFrame, cfg: dict) -> pd.Dat
         return base
 
     out_rows = []
-
-    # Process per employee, per day
     wdf = wdf.sort_values([c_emp, c_sta, c_end]).reset_index(drop=True)
     for emp, sub in wdf.groupby(c_emp, sort=False):
         if sub.empty:
@@ -831,40 +918,31 @@ def enforce_non_preemptive_finish_started(df: pd.DataFrame, cfg: dict) -> pd.Dat
                 continue
             day_df = day_df.sort_values([c_sta, c_end]).copy()
 
-            # Build queue of dict-rows
-            pending = [r._asdict() if hasattr(r, "_asdict") else r.to_dict() for _, r in day_df.iterrows()]
+            pending = [r.to_dict() for _, r in day_df.iterrows()]
             cursor = day_df.iloc[0][c_sta]
 
             while pending:
                 r0 = pending.pop(0)
-                # Align cursor to at least this row's start
                 if pd.isna(r0[c_sta]) or pd.isna(r0[c_end]):
-                    # Skip invalid rows
                     continue
                 start0 = max(cursor, r0[c_sta])
                 dur0_h = float(r0[c_hours]) if pd.notna(r0[c_hours]) else (r0[c_end] - r0[c_sta]).total_seconds()/3600.0
                 key0 = task_key(r0)
 
-                # Collect same-task fragments later in the day (non-preemptive merge)
                 same_idxs = []
                 total_h = dur0_h
                 for i in range(len(pending)):
                     ri = pending[i]
                     if task_key(ri) == key0:
-                        # Only same-day by construction
                         dh = float(ri[c_hours]) if pd.notna(ri[c_hours]) else (ri[c_end] - ri[c_sta]).total_seconds()/3600.0
                         same_idxs.append(i)
                         total_h += dh
 
                 proposed_end = start0 + pd.Timedelta(hours=total_h)
 
-                # Check deadline-only override
                 violates_deadline = False
                 if dl_map:
-                    # If any other task between now and proposed_end has a deadline earlier than proposed_end,
-                    # do not merge the fragments; schedule only r0 now.
                     for ri in pending:
-                        # If its scheduled start was before proposed_end (i.e., would be pushed), check target
                         if pd.isna(ri[c_sta]):
                             continue
                         if ri[c_sta] < proposed_end:
@@ -875,7 +953,6 @@ def enforce_non_preemptive_finish_started(df: pd.DataFrame, cfg: dict) -> pd.Dat
                                 break
 
                 if violates_deadline:
-                    # Keep just r0 as-is (adjusted to cursor)
                     end0 = start0 + pd.Timedelta(hours=dur0_h)
                     rr = dict(r0)
                     rr[c_sta] = start0
@@ -883,12 +960,9 @@ def enforce_non_preemptive_finish_started(df: pd.DataFrame, cfg: dict) -> pd.Dat
                     rr[c_hours] = dur0_h
                     out_rows.append(rr)
                     cursor = end0
-                    # keep the same-task fragments for later (no removal)
                 else:
-                    # Remove the same-task fragments from pending (consume them into this merged block)
                     for idx in sorted(same_idxs, reverse=True):
                         pending.pop(idx)
-                    # Compose merged row
                     endm = proposed_end
                     rr = dict(r0)
                     rr[c_sta] = start0
@@ -898,19 +972,194 @@ def enforce_non_preemptive_finish_started(df: pd.DataFrame, cfg: dict) -> pd.Dat
                     cursor = endm
 
     out = pd.DataFrame(out_rows) if out_rows else wdf
-    # Ensure Hours recomputed precisely if needed
     try:
         out[c_hours] = (pd.to_datetime(out[c_end]) - pd.to_datetime(out[c_sta])).dt.total_seconds()/3600.0
     except Exception:
         pass
-    # Sort consistently
     out = out.sort_values([c_emp, c_sta, c_end]).reset_index(drop=True)
-    # Restore original column order
     cols = df.columns.tolist()
     extra = [c for c in out.columns if c not in cols]
     out = out[[c for c in cols if c in out.columns] + extra]
     return out
 
+def batch_like_tasks(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """
+    Group like stages together within each employee/day to minimize stage switching.
+    Deadline-aware: if moving a task would push it past a target deadline, keep original order for that item.
+    Never starts a task earlier than originally scheduled.
+    """
+    if df is None or df.empty:
+        return df
+
+    c_emp  = _find_col(df, "Assigned To", "Employee", "Worker")
+    c_sta  = _find_col(df, "Start", "Start Time", "start")
+    c_end  = _find_col(df, "End", "End Time", "end")
+    c_hrs  = _find_col(df, "Hours", "Duration", "hours")
+    c_stg  = _find_col(df, "Stage", "stage", "Status")
+    c_cust = _find_col(df, "Customer", "customer", "Client")
+    if any(c is None for c in [c_emp, c_sta, c_end, c_stg]):
+        return df
+
+    w = df.copy()
+    w[c_sta] = pd.to_datetime(w[c_sta], errors="coerce")
+    w[c_end] = pd.to_datetime(w[c_end], errors="coerce")
+    if c_hrs is None:
+        w["__Hours__"] = (w[c_end] - w[c_sta]).dt.total_seconds()/3600.0
+        c_hours = "__Hours__"
+    else:
+        c_hours = c_hrs
+
+    dl_map = _build_deadline_map(cfg)
+
+    out_rows = []
+    w = w.sort_values([c_emp, c_sta, c_end]).reset_index(drop=True)
+
+    for emp, gemp in w.groupby(c_emp, sort=False):
+        gemp = gemp.sort_values([c_sta, c_end]).copy()
+        gemp["__day__"] = gemp[c_sta].dt.date
+        for day, gday in gemp.groupby("__day__", sort=False):
+            gday = gday.sort_values([c_sta, c_end]).copy()
+            if gday.empty:
+                continue
+
+            # Determine base order: sort stage-bases by earliest original start
+            gday["__base__"] = gday[c_stg].map(_stage_base)
+            base_order = (gday.groupby("__base__")[c_sta].min().sort_values().index.tolist())
+
+            # Reorder rows by base order but keep relative order within the same base
+            reordered = pd.concat([gday[gday["__base__"]==b] for b in base_order], axis=0)
+
+            # Build sequential schedule for the day
+            cursor = gday.iloc[0][c_sta]
+            for _, r in reordered.iterrows():
+                orig_start = r[c_sta]; orig_end = r[c_end]; dur = float(r.get(c_hours, 0.0) or 0.0)
+                if pd.isna(orig_start) or pd.isna(orig_end) or dur <= 0:
+                    out_rows.append(r.to_dict()); continue
+                start_new = max(cursor, orig_start)  # never earlier than original
+                end_new   = start_new + pd.Timedelta(hours=dur)
+
+                # Deadline check
+                violates_deadline = False
+                if dl_map:
+                    key = (str(r.get(c_cust,"")).strip().lower(), str(r.get(c_stg,"")).strip().lower())
+                    dl = dl_map.get(key)
+                    if dl is not None and end_new > dl:
+                        violates_deadline = True
+
+                if violates_deadline:
+                    # Keep original placement
+                    out_rows.append(r.to_dict())
+                    cursor = max(cursor, orig_end)
+                else:
+                    rr = r.to_dict()
+                    rr[c_sta] = start_new
+                    rr[c_end] = end_new
+                    rr[c_hours] = dur
+                    out_rows.append(rr)
+                    cursor = end_new
+
+    out = pd.DataFrame(out_rows) if out_rows else w
+    try:
+        out[c_hours] = (pd.to_datetime(out[c_end]) - pd.to_datetime(out[c_sta])).dt.total_seconds()/3600.0
+    except Exception:
+        pass
+    out = out.sort_values([c_emp, c_sta, c_end]).reset_index(drop=True)
+    cols = df.columns.tolist()
+    extra = [c for c in out.columns if c not in cols]
+    out = out[[c for c in cols if c in out.columns] + extra]
+    return out
+
+# -------------------- Carryover injection into next-day schedule --------------------
+def _build_name_to_id():
+    try:
+        df = fetch_df("SELECT id, name FROM employees")
+        return {str(r["name"]): int(r["id"]) for _, r in df.iterrows()}
+    except Exception:
+        return {}
+
+def _employee_has_day_off(emp_id: int, d: date) -> bool:
+    try:
+        df = fetch_df("SELECT 1 FROM employee_days_off WHERE employee_id=? AND off_date=?", (int(emp_id), str(d)))
+        return not df.empty
+    except Exception:
+        return False
+
+def _day_shifts_for_employee(emp_id: int, weekday: int):
+    try:
+        df = fetch_df("SELECT start, end FROM employee_shifts WHERE employee_id=? AND weekday=? ORDER BY start", (int(emp_id), int(weekday)))
+        return [(str(r["start"]), str(r["end"])) for _, r in df.iterrows()]
+    except Exception:
+        return []
+
+def _hhmm_to_dt(d: date, hhmm: str) -> datetime:
+    try:
+        h,m = [int(x) for x in str(hhmm).split(":")[:2]]
+        return datetime(d.year, d.month, d.day, h, m, 0)
+    except Exception:
+        return datetime(d.year, d.month, d.day, 8, 0, 0)
+
+def inject_carryovers_into_cfg(cfg: dict, window_start: datetime, window_end: datetime):
+    """
+    Reads unconsumed task_carryovers and injects them as special project blocks
+    at the start of the next working day(s) for the same employee, within the scheduling window.
+    Marks entries as consumed to avoid double-injection.
+    """
+    try:
+        co = fetch_df("SELECT * FROM task_carryovers WHERE consumed=0 AND carry_to>=? AND carry_to<=? ORDER BY carry_to, employee",
+                      (str(window_start.date()), str(window_end.date())))
+    except Exception:
+        co = pd.DataFrame()
+
+    if co.empty:
+        return
+
+    name_to_id = _build_name_to_id()
+
+    for _, r in co.iterrows():
+        emp_name = str(r["employee"])
+        emp_id = name_to_id.get(emp_name)
+        if not emp_id:
+            continue
+        hours_remaining = float(r["hours_remaining"] or 0.0)
+        if hours_remaining <= 0:
+            continue
+        d = pd.to_datetime(r["carry_to"]).date()
+
+        while hours_remaining > 1e-6 and d <= window_end.date():
+            if _employee_has_day_off(emp_id, d):
+                d += timedelta(days=1)
+                continue
+            weekday = d.weekday()
+            shifts = _day_shifts_for_employee(emp_id, weekday)
+            if not shifts:
+                d += timedelta(days=1)
+                continue
+            for (s, e) in shifts:
+                start_dt = _hhmm_to_dt(d, s)
+                end_dt   = _hhmm_to_dt(d, e)
+                cap_hours = max(0.0, (end_dt - start_dt).total_seconds()/3600.0)
+                if cap_hours <= 0:
+                    continue
+                use_h = min(hours_remaining, cap_hours)
+                label = f"Carryover: {r['stage']} ({r['customer']} – {r['job']})"
+                cfg["special_projects"].append({
+                    "employee": emp_name,
+                    "start": start_dt.strftime("%Y-%m-%d %H:%M"),
+                    "end":   (start_dt + timedelta(hours=use_h)).strftime("%Y-%m-%d %H:%M"),
+                    "label": label
+                })
+                hours_remaining -= use_h
+                if hours_remaining <= 1e-6:
+                    break
+            d += timedelta(days=1)
+
+        # Mark consumed to avoid duplicate injection on next run
+        try:
+            execute("UPDATE task_carryovers SET consumed=1 WHERE id=?", (int(r["id"]),))
+        except Exception:
+            pass
+
+# -------------------- Shared scheduling helpers --------------------
 @st.cache_data(show_spinner=False, ttl=60)
 def run_scheduler_cached():
     try:
@@ -969,9 +1218,19 @@ def run_scheduler_cached():
             except Exception:
                 pass
 
+        # Existing special projects from DB
         for sp in sps:
             emp_name = fetch_df("SELECT name FROM employees WHERE id=?", (sp["employee_id"],)).iloc[0]["name"]
             cfg["special_projects"].append({"employee": emp_name, "start": sp["start_ts"], "end": sp["end_ts"], "label": sp["label"]})
+
+        # Inject carryovers as blocking time at the start of the day(s)
+        window_start = pd.to_datetime(cfg["window"]["start"])
+        window_end = pd.to_datetime(cfg["window"]["end"])
+        try:
+            inject_carryovers_into_cfg(cfg, window_start, window_end)
+        except Exception:
+            # best effort
+            pass
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", encoding="utf-8") as tdf:
             tdf.write(DICT_CSV)
@@ -990,10 +1249,17 @@ def run_scheduler_cached():
         service_blocks, service_stage_orders = ark.load_service_blocks(dict_path)
         job_instances, unsched = ark.build_job_instances(tmp_fore.name, service_blocks, service_stage_orders)
         df = ark.schedule_jobs(cfg, job_instances, service_stage_orders)
+
+        # Post-process: finish-what-you-start then batch similar stages
         try:
             df = enforce_non_preemptive_finish_started(df, cfg)
         except Exception:
             pass
+        try:
+            df = batch_like_tasks(df, cfg)
+        except Exception:
+            pass
+
         return df
     except Exception:
         return None
@@ -1062,14 +1328,15 @@ def user_management_view():
                         ORDER BY u.role, u.name""")
     st.dataframe(users)
 
-    # Reset password / deactivate / relink
+    # Reset password / deactivate / relink / delete
     if not users.empty:
         with st.form("manage_user"):
             uid = st.selectbox("User", users["id"].tolist())
-            action = st.selectbox("Action", ["Reset password","Deactivate","Activate","Link to employee","Unlink employee"])
+            action = st.selectbox("Action", ["Reset password","Deactivate","Activate","Link to employee","Unlink employee","Delete user"])
             emp_list = fetch_df("SELECT id, name FROM employees ORDER BY name")
             link_to = st.selectbox("Employee to link", ["(none)"] + emp_list["name"].tolist())
             new_pw = st.text_input("New password (for reset)", type="password")
+            confirm_text = st.text_input("Type DELETE to confirm deletion", "")
             ok2 = st.form_submit_button("Apply")
             if ok2:
                 try:
@@ -1097,6 +1364,28 @@ def user_management_view():
                     elif action == "Unlink employee":
                         cur.execute("UPDATE users SET employee_id=NULL WHERE id=?", (int(uid),))
                         conn.commit(); conn.close(); st.success("Unlinked from employee.")
+                    elif action == "Delete user":
+                        # Safety: do not delete last admin or yourself
+                        if confirm_text.strip().upper() != "DELETE":
+                            st.warning("Please type DELETE to confirm."); conn.close()
+                        else:
+                            # Is this self?
+                            au = st.session_state.get("auth_user")
+                            if au and int(uid) == int(au.get("id")):
+                                st.error("You cannot delete your own account while signed in."); conn.close()
+                            else:
+                                # Count other admins remaining
+                                cur.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND id <> ?", (int(uid),))
+                                admins_left = cur.fetchone()[0]
+                                cur.execute("SELECT role FROM users WHERE id=?", (int(uid),))
+                                role_row = cur.fetchone()
+                                role_u = role_row[0] if role_row else None
+                                if role_u == "admin" and admins_left <= 0:
+                                    st.error("Cannot delete the last admin account."); conn.close()
+                                else:
+                                    cur.execute("DELETE FROM users WHERE id=?", (int(uid),))
+                                    conn.commit(); conn.close(); st.success("User deleted.")
+                                    st.rerun()
                 except Exception as e:
                     st.error(f"Action failed: {e}")
 
