@@ -1199,26 +1199,28 @@ def batch_like_tasks(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     return out
 
 # -------------------- Carryover injection into next-day schedule --------------------
+
 def align_to_shifts_and_left_pack(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Make the resulting schedule *legal* and *tight* relative to each employee's shift plan.
+    Make the resulting schedule legal and tight relative to each employee's shift plan.
 
-    Key guarantees
-    --------------
-    1) **Shift legality:** No task time lies outside an employee's shift window.
-       Tasks are **split only at day/shift boundaries** when they overlap them.
-    2) **No wait-regressions:** We never move a task *earlier* than its original start.
-       (Protects cure/wait rules you already enforced upstream.)
-    3) **Left‑packing inside each shift:** Remove artificial gaps by packing
-       tasks to the left within a shift while preserving original ordering.
-    4) **Stable order:** Within a shift, tasks keep their original order based
-       on original start times. We don't re-sort by stage here (your batching
-       step already handled that).
+    Guarantees
+    ----------
+    1) Shift legality: No task time lies outside an employee's shift window.
+       Tasks are split only at shift/day boundaries when they overlap them.
+    2) No wait-regressions for finishing coats: we never move those earlier than
+       the row's original start (protects cure/wait rules).
+    3) Left‑packing inside each shift: Remove artificial gaps by packing tasks
+       to the left within a shift while preserving original ordering.
+    4) Stable order: Within a shift, tasks keep their original order based
+       on original start times (after your non‑preemptive/batching passes).
 
-    Notes
-    -----
-    • This pass runs *after* `enforce_non_preemptive_finish_started` and `batch_like_tasks`.
-    • Shifts and days‑off are read from your SQLite tables via helpers in this file.
+    Heuristic tweak
+    ---------------
+    • "Prep-like" stages (e.g., Disassemble, Prep, Sand, Scuff, Clear, Mask, Hardware, Move)
+      *are* allowed to start earlier within the shift window to fill gaps.
+      Everything else (e.g., Prime/Paint/Clear coats) keeps the conservative
+      "not earlier than its original start" rule.
     """
     if df is None or df.empty:
         return df
@@ -1227,6 +1229,8 @@ def align_to_shifts_and_left_pack(df: pd.DataFrame) -> pd.DataFrame:
     c_sta = _find_col(df, "Start", "Start Time", "start")
     c_end = _find_col(df, "End", "End Time", "end")
     c_hrs = _find_col(df, "Hours", "Duration", "hours")
+    c_stg = _find_col(df, "Stage", "stage", "Status")
+
     if any(c is None for c in [c_emp, c_sta, c_end]):
         return df
 
@@ -1239,52 +1243,55 @@ def align_to_shifts_and_left_pack(df: pd.DataFrame) -> pd.DataFrame:
     else:
         c_hours = c_hrs
 
-    # Build map: employee name -> id
+    # Stage family helpers
+    def _is_prep_like(stage_base: str) -> bool:
+        base = (stage_base or "").lower().strip()
+        return base in {
+            "prep","pre","disassemble","disassembly","strip","scrape","sand","scuff","clear","clean",
+            "mask","tape","hardware","move","wrap","pack","unpack","staging","delivery","pickup","load","unload"
+        }
+
     name_to_id = _build_name_to_id()
     out_rows = []
 
     # Helper: split a single row across day boundaries into per-day pieces
-    def split_by_day(row):
+    def _split_by_day(row):
         rs = pd.to_datetime(row[c_sta])
-        re = pd.to_datetime(row[c_end])
-        if pd.isna(rs) or pd.isna(re) or re <= rs:
+        re_ = pd.to_datetime(row[c_end])
+        if pd.isna(rs) or pd.isna(re_) or re_ <= rs:
             return []
         pieces = []
-        day_cursor = rs.normalize()  # 00:00 of rs
-        while day_cursor < re.normalize():
-            day_end = (day_cursor + pd.Timedelta(days=1))
-            seg_start = max(rs, day_cursor)
-            seg_end = min(re, day_end)
-            if seg_end > seg_start:
-                pieces.append((seg_start, seg_end))
-            day_cursor = day_end
-        # Last day (if same day, loop won't add it; handle directly)
+        cur = rs
+        while cur.date() < re_.date():
+            end_day = pd.Timestamp(year=cur.year, month=cur.month, day=cur.day) + pd.Timedelta(days=1)
+            pieces.append((cur, min(end_day, re_)))
+            cur = end_day
         if not pieces:
-            pieces.append((rs, re))
-        elif pieces[-1][1] < re:
-            pieces.append((pieces[-1][1], re))
+            pieces.append((rs, re_))
+        elif pieces[-1][1] < re_:
+            pieces.append((pieces[-1][1], re_))
         return pieces
 
-    # Process employees independently to avoid cross-employee interference
+    # Process per employee
     w = w.sort_values([c_emp, c_sta, c_end]).reset_index(drop=True)
-
     for emp_name, gemp in w.groupby(c_emp, sort=False):
-        emp_id = name_to_id.get(str(emp_name), None)
+        emp_id = name_to_id.get(str(emp_name))
         if gemp.empty:
             continue
 
-        # Explode rows into day‑pieces (so we can legally clip to shifts per day)
+        # Explode rows into day-pieces
         day_bucket = {}  # date -> list of dict rows (pieces)
         for _, r in gemp.iterrows():
-            rs = pd.to_datetime(r[c_sta]); re = pd.to_datetime(r[c_end])
-            if pd.isna(rs) or pd.isna(re) or re <= rs:
+            rs = pd.to_datetime(r[c_sta]); re_ = pd.to_datetime(r[c_end])
+            if pd.isna(rs) or pd.isna(re_) or re_ <= rs:
                 continue
-            for s_piece, e_piece in split_by_day(r):
+            for s_piece, e_piece in _split_by_day(r):
                 d = s_piece.date()
                 rr = r.to_dict()
                 rr[c_sta] = s_piece
                 rr[c_end] = e_piece
-                # Track the *original* first start as the earliest allowed time
+                rr[c_hours] = (e_piece - s_piece).total_seconds() / 3600.0
+                # Track the original first start as the earliest default
                 rr["__earliest__"] = rs
                 day_bucket.setdefault(d, []).append(rr)
 
@@ -1309,22 +1316,27 @@ def align_to_shifts_and_left_pack(df: pd.DataFrame) -> pd.DataFrame:
 
             # For each day-piece, slice into segment-conforming subpieces
             for r in rows:
-                rs = pd.to_datetime(r[c_sta]); re = pd.to_datetime(r[c_end])
+                rs = pd.to_datetime(r[c_sta]); re_ = pd.to_datetime(r[c_end])
                 for i in range(len(seg_map)):
                     s0, e0, lst = seg_map[i]
                     # overlap?
-                    if re <= s0 or rs >= e0:
+                    if re_ <= s0 or rs >= e0:
                         continue
-                    s_sub = max(rs, s0); e_sub = min(re, e0)
+                    s_sub = max(rs, s0); e_sub = min(re_, e0)
                     if e_sub <= s_sub:
                         continue
-                    # Keep a subpiece with original metadata; earliest cannot move earlier than original row start
+                    # Keep a subpiece with original metadata; earliest cannot move earlier than original row start by default
                     rr = dict(r)
                     rr[c_sta] = s_sub
                     rr[c_end] = e_sub
                     rr[c_hours] = (e_sub - s_sub).total_seconds() / 3600.0
-                    # Earliest allowed start for this subpiece = max(original earliest, segment start)
+                    # Earliest allowed start for this subpiece = max(original earliest, segment start) by default
                     rr["__earliest__"] = max(pd.to_datetime(r.get("__earliest__", rs)), s0)
+                    # Stage-based tweak: allow prep-like items to move all the way to segment start
+                    if c_stg is not None:
+                        base = _stage_base(rr.get(c_stg, ""))
+                        if _is_prep_like(base):
+                            rr["__earliest__"] = s0
                     lst.append(rr)
 
             # Within each segment: stable left‑pack respecting earliest allowed start
@@ -1341,15 +1353,14 @@ def align_to_shifts_and_left_pack(df: pd.DataFrame) -> pd.DataFrame:
                         continue
 
                     earliest = pd.to_datetime(rr.get("__earliest__", rr[c_sta]))
-                    # Never start earlier than originally scheduled or than the segment start
+                    # Never start earlier than original policy for non-prep; prep-like may equal segment start (already set)
                     start_new = max(cursor, earliest)
                     if start_new < s0:
                         start_new = s0
                     end_new = start_new + pd.Timedelta(hours=dur_h)
 
                     if end_new > e0:
-                        # If this subpiece doesn't fully fit (should be rare due to slicing),
-                        # clamp to the segment and push the remainder to the next segment
+                        # Clamp if needed (rare due to slicing)
                         fit_h = max(0.0, (e0 - start_new).total_seconds() / 3600.0)
                         if fit_h > 0:
                             rr_fit = dict(rr)
@@ -1357,31 +1368,7 @@ def align_to_shifts_and_left_pack(df: pd.DataFrame) -> pd.DataFrame:
                             rr_fit[c_end] = e0
                             rr_fit[c_hours] = fit_h
                             out_rows.append(rr_fit)
-                            # Create remainder and try to carry it forward into subsequent segments today
-                            rem_h = dur_h - fit_h
-                            if rem_h > 1e-6:
-                                # Try to place remainder immediately in the next segments (keeping earliest as now)
-                                cursor2 = None
-                                placed = False
-                                for s1, e1, _lst2 in seg_map:
-                                    if s1 <= e0:
-                                        continue  # only subsequent segments
-                                    cursor2 = s1
-                                    start2 = max(cursor2, start_new)  # cannot be before we left off
-                                    end2 = start2 + pd.Timedelta(hours=rem_h)
-                                    if end2 <= e1:
-                                        rr2 = dict(rr)
-                                        rr2[c_sta] = start2
-                                        rr2[c_end] = end2
-                                        rr2[c_hours] = rem_h
-                                        rr2["__earliest__"] = start_new
-                                        out_rows.append(rr2)
-                                        placed = True
-                                        break
-                                if not placed:
-                                    # If still not placed within today, keep remainder on its original times (fallback)
-                                    # This keeps us conservative; upstream passes should prevent long spans anyway.
-                                    pass
+                            # Remainder kept as-is to the next segment (conservative)
                         cursor = e0
                     else:
                         rr2 = dict(rr)
